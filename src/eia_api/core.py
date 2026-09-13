@@ -445,12 +445,18 @@ class EIA:
             one row per available value column.
         """
         meta = self.metadata(route)
-        cols = meta.get("data", {}) or {}
+        # Most datasets map each column id to an ``{alias, units}`` dict, but some
+        # (e.g. petroleum/natural-gas price routes) carry an empty list as the
+        # value instead — the label and unit live on the data rows, not here. So
+        # coerce a non-dict ``info`` to blank metadata rather than calling
+        # ``.get`` on it, which would raise for such routes.
+        cols = meta.get("data", {})
+        cols = cols if isinstance(cols, dict) else {}
         rows = [
             {
                 "id": key,
-                "alias": str(info.get("alias", "")),
-                "units": str(info.get("units", "")),
+                "alias": str(info.get("alias", "")) if isinstance(info, dict) else "",
+                "units": str(info.get("units", "")) if isinstance(info, dict) else "",
             }
             for key, info in cols.items()
         ]

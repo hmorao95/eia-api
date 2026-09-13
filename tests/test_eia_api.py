@@ -106,6 +106,40 @@ def _fake_request(endpoint: str, params: list[tuple[str, str]]) -> dict[str, Any
                 {"id": "CA", "name": "California"},
             ]
         }
+    # A petroleum/natural-gas price route: the metadata maps the single "value"
+    # column to an empty list rather than an {alias, units} dict.
+    if endpoint == "petroleum/pri/spt":
+        return {
+            "id": "spt",
+            "routes": [],
+            "frequency": [{"id": "daily", "description": "Daily"}],
+            "facets": [{"id": "series", "description": "Series"}],
+            "data": {"value": []},
+            "startPeriod": "1986-01-02",
+            "endPeriod": "2020-03-15",
+        }
+    if endpoint == "petroleum/pri/spt/data":
+        rows = [
+            {
+                "period": "2020-01-02",
+                "series": "RWTC",
+                "value": "61.18",
+                "value-units": "$/bbl",
+            },
+            {
+                "period": "2020-01-03",
+                "series": "RWTC",
+                "value": "63.05",
+                "value-units": "$/bbl",
+            },
+        ]
+        offset = int(lookup.get("offset", "0"))
+        length = int(lookup.get("length", "5000"))
+        return {
+            "total": str(len(rows)),
+            "frequency": "daily",
+            "data": rows[offset : offset + length],
+        }
     msg = f"unexpected endpoint {endpoint!r}"
     raise AssertionError(msg)
 
@@ -244,6 +278,22 @@ def test_data_columns(client: EIA) -> None:
     frame = client.data_columns("electricity/retail-sales")
     assert set(frame["id"]) == {"price", "revenue"}
     assert frame.loc[frame["id"] == "price", "units"].item() == "cents/kWh"
+
+
+def test_data_columns_handles_listy_metadata(client: EIA) -> None:
+    """A column whose metadata is an empty list still lists its id, no crash."""
+    frame = client.data_columns("petroleum/pri/spt")
+    assert frame["id"].tolist() == ["value"]
+    assert frame["alias"].tolist() == [""]
+    assert frame["units"].tolist() == [""]
+
+
+def test_get_data_default_data_on_listy_metadata(client: EIA) -> None:
+    """get_data(data=None) works on price routes with empty column metadata."""
+    frame = client.get_data("petroleum/pri/spt")
+    assert "value" in frame.columns
+    assert frame["value"].dtype.kind == "f"  # coerced despite blank metadata
+    assert len(frame) == 2
 
 
 def test_facet_values(client: EIA) -> None:
