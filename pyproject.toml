@@ -65,6 +65,8 @@ DEP002 = ["openpyxl", "pyarrow"]
 # --------------------------------------------------------------------------- #
 [tool.codespell]
 skip = "*.lock,.git,.venv,*.csv,*.xlsx"
+# "unparseable" is an accepted spelling variant here, not a typo.
+ignore-words-list = "unparseable"
 
 # --------------------------------------------------------------------------- #
 # interrogate (docstring coverage)
