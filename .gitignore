@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Build artifacts
+dist/
+build/
+
+# Tooling caches / reports
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Local cache of downloaded EIA API responses
+.cache/
+
+# Default outputs folder: keep the folder, ignore everything written into it
+outputs/*
+!outputs/.gitkeep
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/

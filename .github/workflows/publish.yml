@@ -1,0 +1,35 @@
+name: Publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # required for PyPI Trusted Publishing (OIDC)
+
+jobs:
+  pypi:
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Version consistency (tag == pyproject == CITATION)
+        if: github.event_name == 'release'
+        run: |
+          pyproject=$(grep -m1 '^version = ' pyproject.toml | sed -E 's/^version = "([^"]+)".*/\1/')
+          citation=$(grep -m1 '^version:' CITATION.cff | sed -E 's/^version: *"?([0-9][0-9.]*).*/\1/')
+          tag="${GITHUB_REF_NAME#v}"
+          echo "pyproject=$pyproject citation=$citation tag=$tag"
+          test "$pyproject" = "$citation" && test "$pyproject" = "$tag"
+
+      - name: Build
+        run: uv build
+
+      - name: Publish to PyPI
+        run: uv publish

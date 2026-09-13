@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using these metadata."
+title: "eia-api"
+abstract: >-
+  A small Python wrapper for the U.S. Energy Information Administration (EIA)
+  API v2 — electricity, petroleum, natural gas, coal and renewables — that walks
+  the route tree, handles facets and pagination, and returns tidy pandas
+  DataFrames.
+type: software
+authors:
+  - family-names: "Morão"
+    given-names: "Hugo"
+    email: "hfmorao@gmail.com"
+version: "0.1.0"
+date-released: "2026-09-13"
+license: MIT
+repository-code: "https://github.com/hmorao95/eia-api"
+url: "https://github.com/hmorao95/eia-api"
+identifiers:
+  - type: url
+    value: "https://pypi.org/project/eia-api/"
+    description: "The package on the Python Package Index (PyPI)."
+keywords:
+  - eia
+  - energy
+  - api
+  - electricity
+  - petroleum
+  - natural-gas
+  - python
+references:
+  - type: data
+    title: "U.S. Energy Information Administration (EIA) Open Data API v2"
+    authors:
+      - name: "U.S. Energy Information Administration"
+    url: "https://www.eia.gov/opendata/"
+    notes: "Underlying energy statistics accessed through the EIA API."
