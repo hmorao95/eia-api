@@ -169,6 +169,7 @@ ignore = [
     "private-member-access", # Private member accessed
     "magic-value-comparison",# Magic value used in comparison
     "line-too-long",   # long lines in the fixture rows are readable as-is
+    "too-many-return-statements", # the fake-API fixture dispatches on endpoint
     "DOC",    # pydoclint: don't burden test helpers/fixtures with it
 ]
 

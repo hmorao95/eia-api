@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- `data_columns()` (and therefore `get_data(..., data=None)`) no longer crashes
+  on datasets whose metadata maps a column to an empty list instead of an
+  `{alias, units}` dict — e.g. the petroleum (`petroleum/pri/*`) and natural-gas
+  (`natural-gas/pri/*`) price routes. Such columns are now listed with blank
+  alias/units, so a bare `get_data("petroleum/pri/spt")` works.
+
 ## [0.1.0] - 2026-09-13
 
 ### Added
