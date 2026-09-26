@@ -30,3 +30,6 @@ outputs/*
 .DS_Store
 .idea/
 .vscode/
+
+# Sphinx docs build output
+docs/_build/

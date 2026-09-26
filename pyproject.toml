@@ -42,6 +42,11 @@ typing = [
     "types-openpyxl>=3.1",
     "types-requests>=2.32",
 ]
+docs = [
+    "sphinx>=7.3",
+    "pydata-sphinx-theme>=0.15",
+    "myst-parser>=3.0",
+]
 
 [tool.uv]
 default-groups = ["dev", "typing"]
@@ -87,6 +92,9 @@ target-version = "py310"
 src = ["src", "tests"]
 line-length = 88
 indent-width = 4
+# The Sphinx config is boilerplate with its own conventions; keep it out of the
+# lint/format surface (docstring coverage and typing gates ignore it too).
+extend-exclude = ["docs"]
 
 [tool.ruff.format]
 quote-style = "double"

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Documentation site (Sphinx + PyData theme, published to GitHub Pages): install
+  and usage guides, an autodoc API reference for `EIA`, `AsyncEIA` and `Route`, a
+  glossary, and the changelog. Built and deployed by `.github/workflows/docs.yml`
+  (a `docs` dependency group provides Sphinx, the theme and MyST).
 - Async client: `AsyncEIA` (also reachable as `EIA.AsyncAPI`), an `httpx`-backed
   counterpart to `EIA` with coroutine versions of `browse`, `metadata`,
   `frequencies`, `facets`, `facet_values`, `data_columns` and `get_data` (same

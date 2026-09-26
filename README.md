@@ -2,6 +2,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/eia-api.svg)](https://pypi.org/project/eia-api/)
 [![CI](https://github.com/hmorao95/eia-api/actions/workflows/ci.yml/badge.svg)](https://github.com/hmorao95/eia-api/actions/workflows/ci.yml)
+[![Docs](https://github.com/hmorao95/eia-api/actions/workflows/docs.yml/badge.svg)](https://hmorao95.github.io/eia-api/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://github.com/astral-sh/uv)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
