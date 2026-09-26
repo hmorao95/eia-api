@@ -9,6 +9,7 @@ stubbing the ``requests.Session`` used underneath it.
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -393,7 +394,7 @@ def test_get_data_empty_returns_empty(
 
 def test_request_raises_on_api_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """A top-level ``error`` field becomes a clear RuntimeError."""
-    eia = EIA(api_key="bad", cache_dir=None)
+    eia = EIA(api_key="bad", cache_dir="")  # "" disables cache; None = default dir
     payload = {"error": "invalid or missing api_key", "code": 403}
     monkeypatch.setattr(eia.session, "get", lambda *a, **k: _FakeResponse(payload))
     with pytest.raises(RuntimeError, match="invalid or missing api_key"):
@@ -417,6 +418,45 @@ def test_disk_cache_avoids_second_http_hit(
     second = eia._request("electricity", eia._params())  # served from disk
     assert first == second
     assert calls["n"] == 1
+
+
+def test_rate_limit_throttles_close_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second back-to-back request sleeps to honour requests_per_second."""
+    eia = EIA(api_key="k", cache_dir="", requests_per_second=10.0)  # 0.1s apart
+    monkeypatch.setattr(
+        eia.session, "get", lambda *a, **k: _FakeResponse({"response": {}})
+    )
+    clock = {"t": 1000.0}
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
+
+    def _fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["t"] += seconds  # a real sleep would advance the clock
+
+    monkeypatch.setattr(time, "sleep", _fake_sleep)
+
+    eia._request("electricity", eia._params())  # first call: no wait
+    eia._request("electricity", eia._params())  # immediate second: must wait
+    assert len(sleeps) == 1
+    assert sleeps[0] == pytest.approx(0.1)
+
+
+def test_rate_limit_none_disables_throttle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """requests_per_second=None never sleeps, however close the requests."""
+    eia = EIA(api_key="k", cache_dir="", requests_per_second=None)
+    monkeypatch.setattr(
+        eia.session, "get", lambda *a, **k: _FakeResponse({"response": {}})
+    )
+    monkeypatch.setattr(time, "monotonic", lambda: 1000.0)
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+
+    eia._request("electricity", eia._params())
+    eia._request("electricity", eia._params())
+    assert sleeps == []
 
 
 # --------------------------------------------------------------------------- #
