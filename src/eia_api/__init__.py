@@ -7,7 +7,9 @@ re-exported here so that a simple ``from eia_api import EIA`` is enough to get
 started.
 
 Exports:
-    EIA: The main client for browsing routes and downloading data.
+    EIA: The main (synchronous) client for browsing routes and downloading data.
+    AsyncEIA: The asynchronous client (``httpx``-backed); also reachable as
+        ``EIA.AsyncAPI``.
     Route: Immutable metadata (id, name, description) for one node of the API
         route tree.
     main: Entry point for the ``python-fire`` command-line interface.
@@ -15,6 +17,6 @@ Exports:
 
 from __future__ import annotations
 
-from eia_api.core import EIA, Route, main
+from eia_api.core import EIA, AsyncEIA, Route, main
 
-__all__ = ["EIA", "Route", "main"]
+__all__ = ["EIA", "AsyncEIA", "Route", "main"]

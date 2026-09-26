@@ -165,6 +165,30 @@ The tidy frame has a parsed `date` column first, then the API's `period`, the
 facet columns, and each requested value column with its `<column>-units`
 companion.
 
+### Async
+
+For concurrent fetches, use `AsyncEIA` (also reachable as `EIA.AsyncAPI`), the
+`httpx`-backed counterpart to `EIA`. It mirrors the read surface — `browse`,
+`metadata`, `frequencies`, `facets`, `facet_values`, `data_columns` and
+`get_data` — as coroutines, with the same pagination, caching and throttling.
+
+```python
+import asyncio
+from eia_api import AsyncEIA
+
+
+async def main():
+    async with AsyncEIA() as eia:  # closes the HTTP client on exit
+        gas, power = await asyncio.gather(
+            eia.get_data("natural-gas/pri/fut", frequency="monthly"),
+            eia.get_data("electricity/retail-sales", data="price", frequency="monthly"),
+        )
+    return gas, power
+
+
+gas, power = asyncio.run(main())
+```
+
 ## Command line
 
 The CLI is generated from the library with
@@ -272,6 +296,10 @@ EIA(
 
 `requests_per_second` throttles network requests (cache hits are never
 throttled) so bulk pagination stays polite to the API; pass `None` to disable.
+
+`AsyncEIA(...)` (also `EIA.AsyncAPI`) takes the same arguments (plus an optional
+`client=` httpx client) and exposes the read methods as coroutines — see
+[Async](#async).
 
 | Method | Returns |
 |---|---|

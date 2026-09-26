@@ -8,6 +8,7 @@ stubbing the ``requests.Session`` used underneath it.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import time
 from pathlib import Path
@@ -457,6 +458,92 @@ def test_rate_limit_none_disables_throttle(monkeypatch: pytest.MonkeyPatch) -> N
     eia._request("electricity", eia._params())
     eia._request("electricity", eia._params())
     assert sleeps == []
+
+
+# --------------------------------------------------------------------------- #
+# Async client
+# --------------------------------------------------------------------------- #
+
+
+def _async_client(monkeypatch: pytest.MonkeyPatch) -> eia_core.AsyncEIA:
+    """An AsyncEIA whose ``_request`` is the offline synthetic API."""
+    eia = eia_core.AsyncEIA(api_key="test-key", cache_dir="")
+
+    async def _areq(endpoint: str, params: list[tuple[str, str]]) -> dict[str, Any]:
+        return _fake_request(endpoint, list(params))
+
+    monkeypatch.setattr(eia, "_request", _areq)
+    return eia
+
+
+def test_async_api_alias() -> None:
+    """``EIA.AsyncAPI`` is the ``AsyncEIA`` class."""
+    assert EIA.AsyncAPI is eia_core.AsyncEIA
+
+
+def test_async_owns_client_by_default() -> None:
+    """A client created without an httpx client owns (and will close) one."""
+    assert eia_core.AsyncEIA(api_key="k", cache_dir="")._owns_client is True
+
+
+def test_async_aclose_without_client_is_noop() -> None:
+    """Closing before any request was made is a harmless no-op."""
+    asyncio.run(eia_core.AsyncEIA(api_key="k", cache_dir="").aclose())
+
+
+def test_async_browse(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Async browse returns the same child-route frame as the sync client."""
+    eia = _async_client(monkeypatch)
+    frame = asyncio.run(eia.browse())
+    assert list(frame.columns) == ["id", "name", "description"]
+    assert "electricity" in frame["id"].tolist()
+
+
+def test_async_get_data_matches_sync(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Async get_data returns the same tidy frame the sync path would."""
+    eia = _async_client(monkeypatch)
+    frame = asyncio.run(eia.get_data("electricity/retail-sales", data="price"))
+    assert list(frame.columns)[:2] == ["date", "period"]
+    assert frame["price"].dtype.kind == "f"
+    assert len(frame) == 3
+
+
+def test_async_data_columns_handles_listy_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Async data_columns tolerates empty-list column metadata (no crash)."""
+    eia = _async_client(monkeypatch)
+    frame = asyncio.run(eia.data_columns("petroleum/pri/spt"))
+    assert frame["id"].tolist() == ["value"]
+
+
+def test_async_get_data_default_data(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Async get_data(data=None) resolves its columns from metadata."""
+    eia = _async_client(monkeypatch)
+    frame = asyncio.run(eia.get_data("petroleum/pri/spt"))
+    assert "value" in frame.columns
+    assert len(frame) == 2
+
+
+def test_async_throttle_sleeps(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The async throttle awaits a sleep to honour requests_per_second."""
+    eia = eia_core.AsyncEIA(api_key="k", cache_dir="", requests_per_second=10.0)
+    clock = {"t": 1000.0}
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
+
+    async def _fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["t"] += seconds
+
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+
+    async def _run() -> None:
+        await eia._throttle()  # first: no wait
+        await eia._throttle()  # immediate second: must wait
+
+    asyncio.run(_run())
+    assert sleeps == [pytest.approx(0.1)]
 
 
 # --------------------------------------------------------------------------- #

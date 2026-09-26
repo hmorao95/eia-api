@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Async client: `AsyncEIA` (also reachable as `EIA.AsyncAPI`), an `httpx`-backed
+  counterpart to `EIA` with coroutine versions of `browse`, `metadata`,
+  `frequencies`, `facets`, `facet_values`, `data_columns` and `get_data` (same
+  pagination, facet encoding, number coercion and parsed `date` column). Works as
+  an async context manager and shares the on-disk cache and throttle with the
+  sync client, so datasets can be fetched concurrently with `asyncio.gather`.
 - Client-side rate limiting: `EIA(requests_per_second=...)` throttles network
   requests (cache hits are never throttled), sleeping just enough between calls
   to stay under the cap. Defaults to a gentle 9/s so bulk pagination stays polite
