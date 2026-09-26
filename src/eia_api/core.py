@@ -152,6 +152,11 @@ class EIA:
             Most EIA series update daily at most, so the 24-hour default rarely
             serves stale data while still avoiding needless requests.
         timeout (float): Per-request timeout in seconds.
+        requests_per_second (float | None): Client-side throttle. At most this
+            many network requests are issued per second (cache hits are never
+            throttled); the client sleeps just enough between calls to stay under
+            the cap. Defaults to a gentle 9/s so bulk pagination stays polite to
+            the API; pass ``None`` to disable throttling entirely.
         session (requests.Session | None): Optional pre-configured session, for
             example one already set up to route through a corporate proxy. When
             omitted a fresh session is created.
@@ -169,6 +174,7 @@ class EIA:
         cache_dir: str | Path | None = None,
         cache_ttl_hours: float = 24.0,
         timeout: float = 60.0,
+        requests_per_second: float | None = 9.0,
         session: requests.Session | None = None,
     ) -> None:
         """
@@ -185,6 +191,8 @@ class EIA:
                 value to disable disk caching.
             cache_ttl_hours (float): Freshness window for cached responses.
             timeout (float): Per-request timeout in seconds.
+            requests_per_second (float | None): Network-request throttle, or
+                ``None`` to disable it.
             session (requests.Session | None): Optional pre-built HTTP session.
         """
         # Fall back to the environment when no key is passed; validation is
@@ -206,6 +214,15 @@ class EIA:
         self.session = session or requests.Session()
         # ``setdefault`` respects a User-Agent the caller may already have set.
         self.session.headers.setdefault("User-Agent", _USER_AGENT)
+
+        # Client-side throttle: keep at least this many seconds between network
+        # requests (0.0 disables). ``_last_request_monotonic`` starts at 0.0 so
+        # the very first request never waits (the elapsed gap is effectively
+        # infinite against a fresh monotonic clock).
+        self._min_request_interval = (
+            1.0 / requests_per_second if requests_per_second else 0.0
+        )
+        self._last_request_monotonic = 0.0
 
         # In-memory memoisation of route metadata so repeated lookups (e.g. the
         # automatic data-column discovery in ``get_data``) are free per process.
@@ -266,6 +283,24 @@ class EIA:
         digest = hashlib.sha256(blob.encode("utf-8")).hexdigest()
         return self.cache_dir / f"{digest}.json"
 
+    def _throttle(self) -> None:
+        """
+        Sleep just enough to respect the configured requests-per-second cap.
+
+        Called immediately before each network request (never for cache hits).
+        Sleeps for the shortfall between the configured minimum interval and the
+        time elapsed since the previous network request, then records the new
+        request time. A no-op when throttling is disabled.
+        """
+        if not self._min_request_interval:
+            return
+        wait = self._min_request_interval - (
+            time.monotonic() - self._last_request_monotonic
+        )
+        if wait > 0:
+            time.sleep(wait)
+        self._last_request_monotonic = time.monotonic()
+
     def _request(
         self, endpoint: str, params: Sequence[tuple[str, str]]
     ) -> dict[str, Any]:
@@ -299,6 +334,8 @@ class EIA:
                 cached_response: dict[str, Any] = cached["response"]
                 return cached_response
 
+        # Only real network requests are throttled; cache hits returned above.
+        self._throttle()
         resp = self.session.get(
             _BASE_URL + endpoint, params=list(params), timeout=self.timeout
         )

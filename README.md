@@ -260,8 +260,18 @@ folder; pass a path with a directory to write elsewhere.
 ### Python API
 
 ```python
-EIA(api_key=None, cache_dir=None, cache_ttl_hours=24.0, timeout=60.0, session=None)
+EIA(
+    api_key=None,
+    cache_dir=None,
+    cache_ttl_hours=24.0,
+    timeout=60.0,
+    requests_per_second=9.0,
+    session=None,
+)
 ```
+
+`requests_per_second` throttles network requests (cache hits are never
+throttled) so bulk pagination stays polite to the API; pass `None` to disable.
 
 | Method | Returns |
 |---|---|

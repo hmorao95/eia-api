@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Client-side rate limiting: `EIA(requests_per_second=...)` throttles network
+  requests (cache hits are never throttled), sleeping just enough between calls
+  to stay under the cap. Defaults to a gentle 9/s so bulk pagination stays polite
+  to the API; pass `None` to disable.
+
 ### Fixed
 
 - `data_columns()` (and therefore `get_data(..., data=None)`) no longer crashes
