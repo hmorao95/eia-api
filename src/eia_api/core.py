@@ -73,10 +73,8 @@ import requests  # HTTP client for calling the EIA REST API.
 
 if TYPE_CHECKING:
     # Imported only for type checking to keep the runtime import graph small;
-    # these names are used purely in annotations. ``Self`` (typing, 3.11+) is
-    # safe here because postponed annotations never evaluate it at runtime.
+    # these names are used purely in annotations.
     from collections.abc import Iterable, Mapping, Sequence
-    from typing import Self
 
 # Only the public surface is exported; helpers and the CLI facade stay private.
 __all__ = ["EIA", "AsyncEIA", "Route"]
@@ -1336,12 +1334,12 @@ class AsyncEIA:
         self._owns_client = client is None
         self._meta_cache: dict[str, dict[str, Any]] = {}
 
-    async def __aenter__(self) -> Self:
+    async def __aenter__(self) -> AsyncEIA:  # ruff: ignore[non-self-return-type] - concrete class is fine
         """
         Enter the async context.
 
         Returns:
-            Self: This client, unchanged.
+            AsyncEIA: This client, unchanged.
         """
         return self
 
