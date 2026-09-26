@@ -57,6 +57,7 @@ from __future__ import (  # Enables modern (PEP 604 / postponed) annotations.
     annotations,
 )
 
+import asyncio  # Backs the async client's non-blocking throttle sleep.
 import hashlib  # Derives the on-disk cache filename from the request signature.
 import json  # Serialises the cache key and reads/writes cached JSON payloads.
 import os  # Reads the EIA_API_KEY environment variable as a key fallback.
@@ -66,16 +67,19 @@ from dataclasses import dataclass  # Builds the immutable Route value type.
 from pathlib import Path  # Cross-platform filesystem paths for the cache/outputs.
 from typing import TYPE_CHECKING, Any, ClassVar  # Typing-only helpers.
 
+import httpx  # Async HTTP client backing :class:`AsyncEIA`.
 import pandas as pd  # The core tabular data type used throughout the module.
 import requests  # HTTP client for calling the EIA REST API.
 
 if TYPE_CHECKING:
     # Imported only for type checking to keep the runtime import graph small;
-    # these names are used purely in annotations.
+    # these names are used purely in annotations. ``Self`` (typing, 3.11+) is
+    # safe here because postponed annotations never evaluate it at runtime.
     from collections.abc import Iterable, Mapping, Sequence
+    from typing import Self
 
 # Only the public surface is exported; helpers and the CLI facade stay private.
-__all__ = ["EIA", "Route"]
+__all__ = ["EIA", "AsyncEIA", "Route"]
 
 # Root of the versioned API. Every route path is appended to this base, and the
 # metadata endpoint for a route is the route itself while its rows live under an
@@ -95,6 +99,227 @@ _ENV_KEY = "EIA_API_KEY"
 _USER_AGENT = (
     "Mozilla/5.0 (compatible; eia-api-wrapper/1.0; +https://www.eia.gov/opendata/)"
 )
+
+
+def _cache_path(
+    cache_dir: Path | None, endpoint: str, params: Sequence[tuple[str, str]]
+) -> Path | None:
+    """
+    Return the on-disk cache path for a request, or ``None`` when disabled.
+
+    Shared by the sync and async clients so both derive an identical filename.
+    The name is a SHA-256 digest of the endpoint plus the request parameters with
+    the API key stripped out, so the secret never influences (or leaks into) the
+    cache key and two callers with different keys share the same cached payload.
+
+    Args:
+        cache_dir (Path | None): Cache directory, or ``None`` if caching is off.
+        endpoint (str): The route path being requested (below the base URL).
+        params (Sequence[tuple[str, str]]): Request parameters as (name, value)
+            pairs, including the ``api_key`` pair.
+
+    Returns:
+        Path | None: The cache file path, or ``None`` if caching is disabled.
+    """
+    if not cache_dir:
+        return None
+    # Exclude the api_key so the digest is stable across keys and the secret is
+    # never part of a filename; sort for order-independence.
+    signature = sorted((k, v) for k, v in params if k != "api_key")
+    blob = json.dumps([endpoint, signature], separators=(",", ":"))
+    digest = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+    return cache_dir / f"{digest}.json"
+
+
+def _routes_frame(meta: Mapping[str, Any]) -> pd.DataFrame:
+    """
+    Build the child-route DataFrame from a route's metadata object.
+
+    Args:
+        meta (Mapping[str, Any]): A decoded metadata ``response`` object.
+
+    Returns:
+        pd.DataFrame: Columns ``[id, name, description]``, one row per child
+        route (empty when the route is a leaf dataset).
+    """
+    rows = [
+        {
+            "id": str(r.get("id", "")),
+            "name": str(r.get("name", "")),
+            "description": str(r.get("description", "")),
+        }
+        for r in meta.get("routes", [])
+    ]
+    return pd.DataFrame(rows, columns=["id", "name", "description"])
+
+
+def _data_columns_frame(meta: Mapping[str, Any]) -> pd.DataFrame:
+    """
+    Build the value-column DataFrame from a dataset's metadata object.
+
+    Args:
+        meta (Mapping[str, Any]): A decoded metadata ``response`` object.
+
+    Returns:
+        pd.DataFrame: Columns ``[id, alias, units]`` (missing pieces blank), one
+        row per available value column.
+    """
+    # Most datasets map each column id to an ``{alias, units}`` dict, but some
+    # (e.g. petroleum/natural-gas price routes) carry an empty list as the value
+    # instead — the label and unit live on the data rows, not here. So coerce a
+    # non-dict ``info`` to blank metadata rather than calling ``.get`` on it,
+    # which would raise for such routes.
+    cols = meta.get("data", {})
+    cols = cols if isinstance(cols, dict) else {}
+    rows = [
+        {
+            "id": key,
+            "alias": str(info.get("alias", "")) if isinstance(info, dict) else "",
+            "units": str(info.get("units", "")) if isinstance(info, dict) else "",
+        }
+        for key, info in cols.items()
+    ]
+    return pd.DataFrame(rows, columns=["id", "alias", "units"])
+
+
+def _norm_route(route: str) -> str:
+    """
+    Canonicalise a user-supplied route path (shared by both clients).
+
+    Trims surrounding slashes/whitespace and drops a trailing ``/data`` segment,
+    so ``"/electricity/retail-sales/data/"`` and ``"electricity/retail-sales"``
+    address the same node. The ``/data`` and ``/facet`` suffixes are appended by
+    the client, never by the caller.
+
+    Args:
+        route (str): The route path as supplied by the caller.
+
+    Returns:
+        str: The cleaned route with no leading/trailing slash and no trailing
+        ``/data`` segment.
+    """
+    cleaned = route.strip().strip("/")
+    if cleaned.endswith("/data"):
+        cleaned = cleaned[: -len("/data")].strip("/")
+    return cleaned
+
+
+def _parse_period_series(period: pd.Series) -> pd.Series:
+    """
+    Parse EIA period labels of any frequency into period-start Timestamps.
+
+    Labels vary by frequency: a bare year (``"2020"``), a month (``"2020-03"``),
+    a quarter (``"2020-Q1"``), a date (``"2020-03-15"``) or an hour
+    (``"2020-03-15T05"``). Quarters map to their first month; everything else
+    uses pandas' mixed-format parser. Unparseable labels become ``NaT``.
+
+    Args:
+        period (pd.Series): The raw ``period`` column returned by the API.
+
+    Returns:
+        pd.Series: Period-start Timestamps, with unparseable labels as ``NaT``.
+    """
+    s = period.astype("string")
+    out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+
+    # Quarterly labels ("2020-Q1") have no calendar day, so map each to the first
+    # month of its quarter: Q1->Jan, Q2->Apr, Q3->Jul, Q4->Oct.
+    is_q = s.str.contains("Q", case=False, na=False)
+    if is_q.any():
+        parts = s[is_q].str.extract(r"(\d{4}).*?[Qq]([1-4])")
+        months = (parts[1].astype(int) - 1) * 3 + 1
+        out.loc[is_q] = pd.to_datetime(
+            {"year": parts[0].astype(int), "month": months, "day": 1}
+        ).to_numpy()
+
+    # Everything else (year/month/date/hour) parses directly; "mixed" opts in to
+    # per-element inference so heterogeneous labels do not warn.
+    rest = ~is_q
+    if rest.any():
+        out.loc[rest] = pd.to_datetime(
+            s[rest], errors="coerce", format="mixed"
+        ).to_numpy()
+    return out
+
+
+def _encode_data_params(
+    *,
+    columns: list[str],
+    facets: Mapping[str, str | Iterable[str]] | None,
+    frequency: str | None,
+    start: str | None,
+    end: str | None,
+    sort: Sequence[tuple[str, str]],
+    offset: int,
+    length: int,
+) -> list[tuple[str, str]]:
+    """
+    Encode a data query into the API's bracketed query parameters.
+
+    The EIA API expects repeated bracketed keys (``data[]``, ``facets[<id>][]``,
+    ``sort[<i>][column]``), represented here as a list of (name, value) pairs so
+    the HTTP client sends each occurrence. See :meth:`EIA.get_data` for meanings.
+
+    Args:
+        columns (list[str]): Value-column ids for ``data[]``.
+        facets (Mapping[str, str | Iterable[str]] | None): Facet filters.
+        frequency (str | None): Requested periodicity.
+        start (str | None): Inclusive lower period bound.
+        end (str | None): Inclusive upper period bound.
+        sort (Sequence[tuple[str, str]]): Sort keys.
+        offset (int): Row offset.
+        length (int): Page size.
+
+    Returns:
+        list[tuple[str, str]]: The encoded query parameters (without the key).
+    """
+    params: list[tuple[str, str]] = []
+    if frequency:
+        params.append(("frequency", frequency))
+    params.extend(("data[]", col) for col in columns)
+    for facet_id, values in (facets or {}).items():
+        # Accept a single value as a plain string, not only an iterable.
+        items = [values] if isinstance(values, str) else list(values)
+        params.extend((f"facets[{facet_id}][]", str(v)) for v in items)
+    if start:
+        params.append(("start", start))
+    if end:
+        params.append(("end", end))
+    for i, (column, direction) in enumerate(sort):
+        params.extend(
+            [(f"sort[{i}][column]", column), (f"sort[{i}][direction]", direction)]
+        )
+    params.extend([("offset", str(offset)), ("length", str(length))])
+    return params
+
+
+def _rows_to_frame(rows: list[dict[str, Any]], columns: list[str]) -> pd.DataFrame:
+    """
+    Assemble the tidy DataFrame from accumulated rows (shared by both clients).
+
+    Coerces the requested value columns to numbers (the API returns them as
+    strings) and inserts a parsed ``date`` column ahead of the raw ``period``. An
+    empty result yields an empty frame.
+
+    Args:
+        rows (list[dict[str, Any]]): Accumulated raw row dictionaries.
+        columns (list[str]): The requested value-column ids to coerce.
+
+    Returns:
+        pd.DataFrame: The tidy result described in :meth:`EIA.get_data`.
+    """
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+    # Value cells arrive as strings; coerce the requested measures to numbers
+    # (leaving their "<col>-units" companions as text).
+    for col in columns:
+        if col in frame.columns:
+            frame[col] = pd.to_numeric(frame[col], errors="coerce")
+    # Add a parsed calendar date ahead of the API's native period label.
+    if "period" in frame.columns:
+        frame.insert(0, "date", _parse_period_series(frame["period"]))
+    return frame
 
 
 @dataclass(frozen=True)
@@ -167,6 +392,10 @@ class EIA:
     # other column (the period plus the facet columns) forms the natural key used
     # by the incremental helpers to decide which rows are new or revised.
     _UNITS_SUFFIX: ClassVar[str] = "-units"
+
+    # Bound just after :class:`AsyncEIA` is defined (below), so the async client
+    # is reachable as ``EIA.AsyncAPI`` for parity with the sync entry point.
+    AsyncAPI: ClassVar[type[AsyncEIA]]
 
     def __init__(
         self,
@@ -249,10 +478,7 @@ class EIA:
             str: The cleaned route with no leading/trailing slash and no trailing
             ``/data`` segment.
         """
-        cleaned = route.strip().strip("/")
-        if cleaned.endswith("/data"):
-            cleaned = cleaned[: -len("/data")].strip("/")
-        return cleaned
+        return _norm_route(route)
 
     def _cache_path(
         self, endpoint: str, params: Sequence[tuple[str, str]]
@@ -273,15 +499,7 @@ class EIA:
         Returns:
             Path | None: The cache file path, or ``None`` if caching is disabled.
         """
-        if not self.cache_dir:
-            return None
-        # Exclude the api_key so the digest is stable across keys and the secret
-        # is never part of a filename; sort for order-independence.
-        signature = [(k, v) for k, v in params if k != "api_key"]
-        signature.sort()
-        blob = json.dumps([endpoint, signature], separators=(",", ":"))
-        digest = hashlib.sha256(blob.encode("utf-8")).hexdigest()
-        return self.cache_dir / f"{digest}.json"
+        return _cache_path(self.cache_dir, endpoint, params)
 
     def _throttle(self) -> None:
         """
@@ -417,22 +635,7 @@ class EIA:
             pd.DataFrame: Columns ``[id, name, description]``, one row per child
             route (empty when the route is a leaf dataset).
         """
-        meta = self.metadata(route)
-        routes = [
-            Route(
-                id=str(r.get("id", "")),
-                name=str(r.get("name", "")),
-                description=str(r.get("description", "")),
-            )
-            for r in meta.get("routes", [])
-        ]
-        return pd.DataFrame(
-            [
-                {"id": r.id, "name": r.name, "description": r.description}
-                for r in routes
-            ],
-            columns=["id", "name", "description"],
-        )
+        return _routes_frame(self.metadata(route))
 
     def frequencies(self, route: str) -> pd.DataFrame:
         """
@@ -481,23 +684,7 @@ class EIA:
             pd.DataFrame: Columns ``[id, alias, units]`` (missing pieces blank),
             one row per available value column.
         """
-        meta = self.metadata(route)
-        # Most datasets map each column id to an ``{alias, units}`` dict, but some
-        # (e.g. petroleum/natural-gas price routes) carry an empty list as the
-        # value instead — the label and unit live on the data rows, not here. So
-        # coerce a non-dict ``info`` to blank metadata rather than calling
-        # ``.get`` on it, which would raise for such routes.
-        cols = meta.get("data", {})
-        cols = cols if isinstance(cols, dict) else {}
-        rows = [
-            {
-                "id": key,
-                "alias": str(info.get("alias", "")) if isinstance(info, dict) else "",
-                "units": str(info.get("units", "")) if isinstance(info, dict) else "",
-            }
-            for key, info in cols.items()
-        ]
-        return pd.DataFrame(rows, columns=["id", "alias", "units"])
+        return _data_columns_frame(self.metadata(route))
 
     def facet_values(self, route: str, facet_id: str) -> pd.DataFrame:
         """
@@ -559,31 +746,7 @@ class EIA:
             pd.Series: Period-start Timestamps, with unparseable labels as
             ``NaT``.
         """
-        s = period.astype("string")
-        out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
-
-        # Quarterly labels ("2020-Q1") have no calendar day, so map each to the
-        # first month of its quarter: Q1->Jan, Q2->Apr, Q3->Jul, Q4->Oct.
-        is_q = s.str.contains("Q", case=False, na=False)
-        if is_q.any():
-            parts = s[is_q].str.extract(r"(\d{4}).*?[Qq]([1-4])")
-            months = (parts[1].astype(int) - 1) * 3 + 1
-            out.loc[is_q] = pd.to_datetime(
-                {
-                    "year": parts[0].astype(int),
-                    "month": months,
-                    "day": 1,
-                }
-            ).to_numpy()
-
-        # Everything else (year/month/date/hour) parses directly; "mixed" opts in
-        # to per-element inference so heterogeneous labels do not warn.
-        rest = ~is_q
-        if rest.any():
-            out.loc[rest] = pd.to_datetime(
-                s[rest], errors="coerce", format="mixed"
-            ).to_numpy()
-        return out
+        return _parse_period_series(period)
 
     def get_data(
         self,
@@ -764,30 +927,19 @@ class EIA:
         Returns:
             list[tuple[str, str]]: The encoded query parameters (without the key).
         """
-        params: list[tuple[str, str]] = []
-        if frequency:
-            params.append(("frequency", frequency))
-        params.extend(("data[]", col) for col in columns)
-        for facet_id, values in (facets or {}).items():
-            # Accept a single value as a plain string, not only an iterable.
-            items = [values] if isinstance(values, str) else list(values)
-            params.extend((f"facets[{facet_id}][]", str(v)) for v in items)
-        if start:
-            params.append(("start", start))
-        if end:
-            params.append(("end", end))
-        for i, (column, direction) in enumerate(sort):
-            params.extend(
-                [
-                    (f"sort[{i}][column]", column),
-                    (f"sort[{i}][direction]", direction),
-                ]
-            )
-        params.extend([("offset", str(offset)), ("length", str(length))])
-        return params
+        return _encode_data_params(
+            columns=columns,
+            facets=facets,
+            frequency=frequency,
+            start=start,
+            end=end,
+            sort=sort,
+            offset=offset,
+            length=length,
+        )
 
-    @classmethod
-    def _to_frame(cls, rows: list[dict[str, Any]], columns: list[str]) -> pd.DataFrame:
+    @staticmethod
+    def _to_frame(rows: list[dict[str, Any]], columns: list[str]) -> pd.DataFrame:
         """
         Assemble the tidy DataFrame from accumulated rows.
 
@@ -802,18 +954,7 @@ class EIA:
         Returns:
             pd.DataFrame: The tidy result described in :meth:`get_data`.
         """
-        frame = pd.DataFrame(rows)
-        if frame.empty:
-            return frame
-        # Value cells arrive as strings; coerce the requested measures to numbers
-        # (leaving their "<col>-units" companions as text).
-        for col in columns:
-            if col in frame.columns:
-                frame[col] = pd.to_numeric(frame[col], errors="coerce")
-        # Add a parsed calendar date ahead of the API's native period label.
-        if "period" in frame.columns:
-            frame.insert(0, "date", cls._parse_period(frame["period"]))
-        return frame
+        return _rows_to_frame(rows, columns)
 
     # ------------------------------------------------------------------ #
     # Export
@@ -1118,6 +1259,372 @@ class EIA:
         )
         combined.to_csv(path, index=False)
         return changed
+
+
+class AsyncEIA:
+    """
+    Async counterpart of :class:`EIA`, backed by ``httpx.AsyncClient``.
+
+    Mirrors the read surface of :class:`EIA` — route browsing, metadata
+    inspection and :meth:`get_data` (with the same automatic pagination, facet
+    encoding, number coercion and parsed ``date`` column) — but every network
+    method is a coroutine, so many datasets can be fetched concurrently with
+    ``asyncio.gather``. On-disk response caching and client-side throttling behave
+    exactly as in the sync client, and the two share their cache directory and
+    file format.
+
+    Use it as an async context manager so the underlying HTTP client is closed
+    cleanly (or call :meth:`aclose` yourself)::
+
+        async with AsyncEIA() as eia:
+            monthly, retail = await asyncio.gather(
+                eia.get_data("natural-gas/pri/fut", frequency="monthly"),
+                eia.get_data("electricity/retail-sales", data="price"),
+            )
+
+    It is also reachable as :attr:`EIA.AsyncAPI` for parity with the sync client.
+
+    Args:
+        api_key (str | None): EIA API key; falls back to ``EIA_API_KEY``.
+        cache_dir (str | Path | None): Response cache directory; ``None`` uses the
+            default ``~/.cache/eia_api`` (shared with :class:`EIA`), any other
+            falsy value disables caching.
+        cache_ttl_hours (float): Freshness window for cached responses.
+        timeout (float): Per-request timeout in seconds.
+        requests_per_second (float | None): Network-request throttle, or ``None``
+            to disable it.
+        client (httpx.AsyncClient | None): Optional pre-built async client. When
+            omitted one is created lazily and closed by :meth:`aclose`.
+    """
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        cache_dir: str | Path | None = None,
+        cache_ttl_hours: float = 24.0,
+        timeout: float = 60.0,
+        requests_per_second: float | None = 9.0,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        """
+        Initialise the async client; see the class docstring for the arguments.
+
+        Args:
+            api_key (str | None): API key, or ``None`` to read ``EIA_API_KEY``.
+            cache_dir (str | Path | None): Cache directory, or a falsy value to
+                disable disk caching.
+            cache_ttl_hours (float): Freshness window for cached responses.
+            timeout (float): Per-request timeout in seconds.
+            requests_per_second (float | None): Network-request throttle, or
+                ``None`` to disable it.
+            client (httpx.AsyncClient | None): Optional pre-built async client.
+        """
+        self.api_key = api_key or os.environ.get(_ENV_KEY)
+        if cache_dir is None:
+            cache_dir = Path.home() / ".cache" / "eia_api"
+        self.cache_dir = Path(cache_dir) if cache_dir else None
+        if self.cache_dir:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_ttl_seconds = cache_ttl_hours * 3600.0
+        self.timeout = timeout
+        self._min_request_interval = (
+            1.0 / requests_per_second if requests_per_second else 0.0
+        )
+        self._last_request_monotonic = 0.0
+        # A caller-supplied client is never closed by us; a lazily-created one is.
+        self._client = client
+        self._owns_client = client is None
+        self._meta_cache: dict[str, dict[str, Any]] = {}
+
+    async def __aenter__(self) -> Self:
+        """
+        Enter the async context.
+
+        Returns:
+            Self: This client, unchanged.
+        """
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        """Close the owned HTTP client when leaving the context."""
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        """Close the underlying HTTP client if this instance created it."""
+        if self._owns_client and self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    def _params(self, extra: Iterable[tuple[str, str]] = ()) -> list[tuple[str, str]]:
+        """
+        Build the base parameter list, injecting the (validated) API key.
+
+        Args:
+            extra (Iterable[tuple[str, str]]): Additional (name, value) pairs to
+                append after the ``api_key`` pair.
+
+        Returns:
+            list[tuple[str, str]]: The parameter list starting with the API key.
+
+        Raises:
+            ValueError: If no API key was configured.
+        """
+        if not self.api_key:
+            msg = (
+                "No EIA API key configured. Pass api_key=... or set the "
+                f"{_ENV_KEY} environment variable. Register for a free key at "
+                "https://www.eia.gov/opendata/."
+            )
+            raise ValueError(msg)
+        return [("api_key", self.api_key), *extra]
+
+    async def _throttle(self) -> None:
+        """
+        Async throttle: ``await asyncio.sleep`` to honour requests_per_second.
+
+        Mirrors :meth:`EIA._throttle` but yields to the event loop instead of
+        blocking it, so concurrent tasks share the rate budget cooperatively.
+        """
+        if not self._min_request_interval:
+            return
+        wait = self._min_request_interval - (
+            time.monotonic() - self._last_request_monotonic
+        )
+        if wait > 0:
+            await asyncio.sleep(wait)
+        self._last_request_monotonic = time.monotonic()
+
+    async def _request(
+        self, endpoint: str, params: Sequence[tuple[str, str]]
+    ) -> dict[str, Any]:
+        """
+        Perform one async GET against the API and return its ``response`` object.
+
+        The sync/async twin of :meth:`EIA._request`: it serves a fresh cached
+        payload when one exists within the TTL; otherwise throttles, calls the
+        API over httpx, surfaces the API's top-level ``error`` field as a clear
+        exception, persists the payload and returns it.
+
+        Args:
+            endpoint (str): The route path to request, below the base URL and
+                already including any ``/data`` or ``/facet/<id>`` suffix.
+            params (Sequence[tuple[str, str]]): Request parameters as
+                (name, value) pairs. The ``api_key`` pair must be present.
+
+        Returns:
+            dict[str, Any]: The decoded ``response`` object from the payload.
+
+        Raises:
+            RuntimeError: If the API returns an ``error`` field.
+        """
+        cache_file = _cache_path(self.cache_dir, endpoint, params)
+        if cache_file and cache_file.exists():
+            age = time.time() - cache_file.stat().st_mtime
+            if age < self.cache_ttl_seconds:
+                cached = json.loads(cache_file.read_text("utf-8"))
+                cached_response: dict[str, Any] = cached["response"]
+                return cached_response
+
+        # Only real network requests are throttled; cache hits returned above.
+        await self._throttle()
+        if self._client is None:
+            self._client = httpx.AsyncClient(headers={"User-Agent": _USER_AGENT})
+            self._owns_client = True
+        resp = await self._client.get(
+            _BASE_URL + endpoint, params=list(params), timeout=self.timeout
+        )
+        payload = resp.json()
+        if isinstance(payload, dict) and payload.get("error"):
+            msg = f"EIA API error: {payload['error']} (code {payload.get('code')})"
+            raise RuntimeError(msg)
+        resp.raise_for_status()
+
+        if cache_file:
+            cache_file.write_text(json.dumps(payload), encoding="utf-8")
+        response: dict[str, Any] = payload["response"]
+        return response
+
+    async def metadata(self, route: str = "") -> dict[str, Any]:
+        """
+        Return the raw metadata object for a route (async :meth:`EIA.metadata`).
+
+        Args:
+            route (str): Route path, ``""`` for the top level. Any trailing
+                ``/data`` is ignored.
+
+        Returns:
+            dict[str, Any]: The decoded metadata ``response`` object.
+        """
+        route = _norm_route(route)
+        if route in self._meta_cache:
+            return self._meta_cache[route]
+        meta = await self._request(route, self._params())
+        self._meta_cache[route] = meta
+        return meta
+
+    async def browse(self, route: str = "") -> pd.DataFrame:
+        """
+        List the child routes beneath a route (async :meth:`EIA.browse`).
+
+        Args:
+            route (str): Route path to list beneath (``""`` for the top level).
+
+        Returns:
+            pd.DataFrame: Columns ``[id, name, description]`` (empty at a leaf).
+        """
+        return _routes_frame(await self.metadata(route))
+
+    async def frequencies(self, route: str) -> pd.DataFrame:
+        """
+        List a dataset's frequencies (async :meth:`EIA.frequencies`).
+
+        Args:
+            route (str): Dataset route path.
+
+        Returns:
+            pd.DataFrame: One row per supported frequency.
+        """
+        meta = await self.metadata(route)
+        return pd.DataFrame(meta.get("frequency", []))
+
+    async def facets(self, route: str) -> pd.DataFrame:
+        """
+        List a dataset's facets (async :meth:`EIA.facets`).
+
+        Args:
+            route (str): Dataset route path.
+
+        Returns:
+            pd.DataFrame: One row per facet (filtering dimension).
+        """
+        meta = await self.metadata(route)
+        return pd.DataFrame(meta.get("facets", []))
+
+    async def data_columns(self, route: str) -> pd.DataFrame:
+        """
+        List a dataset's value columns (async :meth:`EIA.data_columns`).
+
+        Args:
+            route (str): Dataset route path.
+
+        Returns:
+            pd.DataFrame: Columns ``[id, alias, units]``, one row per column.
+        """
+        return _data_columns_frame(await self.metadata(route))
+
+    async def facet_values(self, route: str, facet_id: str) -> pd.DataFrame:
+        """
+        List a facet's allowed values (async :meth:`EIA.facet_values`).
+
+        Args:
+            route (str): Dataset route path.
+            facet_id (str): The facet whose values to enumerate.
+
+        Returns:
+            pd.DataFrame: One row per facet value.
+        """
+        route = _norm_route(route)
+        meta = await self._request(f"{route}/facet/{facet_id}", self._params())
+        return pd.DataFrame(meta.get("facets", []))
+
+    async def _resolve_data(
+        self, route: str, data: str | Iterable[str] | None
+    ) -> list[str]:
+        """
+        Resolve requested value columns, defaulting to all (async twin).
+
+        Args:
+            route (str): Dataset route path.
+            data (str | Iterable[str] | None): One column, several, or ``None``.
+
+        Returns:
+            list[str]: The value-column ids to request.
+        """
+        if data is None:
+            frame = await self.data_columns(route)
+            return frame["id"].tolist()
+        if isinstance(data, str):
+            return [data]
+        return list(data)
+
+    async def get_data(
+        self,
+        route: str,
+        data: str | Iterable[str] | None = None,
+        facets: Mapping[str, str | Iterable[str]] | None = None,
+        frequency: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
+        sort: Sequence[tuple[str, str]] | None = None,
+        offset: int = 0,
+        length: int = _MAX_LENGTH,
+        max_rows: int | None = None,
+    ) -> pd.DataFrame:
+        """
+        Fetch a dataset's rows into a tidy DataFrame (async :meth:`EIA.get_data`).
+
+        Behaves exactly like the sync method — same arguments, pagination, facet
+        encoding, number coercion and parsed ``date`` column — but awaits each
+        page, so multiple ``get_data`` calls can run concurrently.
+
+        Args:
+            route (str): Dataset route path; any trailing ``/data`` is ignored.
+            data (str | Iterable[str] | None): Value column(s); ``None`` for all.
+            facets (Mapping[str, str | Iterable[str]] | None): Facet filters.
+            frequency (str | None): Periodicity; ``None`` uses the default.
+            start (str | None): Inclusive lower period bound.
+            end (str | None): Inclusive upper period bound.
+            sort (Sequence[tuple[str, str]] | None): Sort keys; defaults to
+                ``[("period", "asc")]`` for stable pagination.
+            offset (int): Starting row offset (pagination is automatic).
+            length (int): Page size per request, capped at 5000.
+            max_rows (int | None): Stop after this many rows; ``None`` for all.
+
+        Returns:
+            pd.DataFrame: The tidy result, identical in shape to the sync client.
+
+        Raises:
+            ValueError: If ``length`` is not positive.
+        """
+        if length <= 0:
+            msg = f"length must be a positive integer, got {length}."
+            raise ValueError(msg)
+
+        route = _norm_route(route)
+        columns = await self._resolve_data(route, data)
+        sort = sort or [("period", "asc")]
+        page = min(length, _MAX_LENGTH)
+
+        rows: list[dict[str, Any]] = []
+        while True:
+            extra = _encode_data_params(
+                columns=columns,
+                facets=facets,
+                frequency=frequency,
+                start=start,
+                end=end,
+                sort=sort,
+                offset=offset,
+                length=page,
+            )
+            resp = await self._request(f"{route}/data", self._params(extra))
+            batch = resp.get("data", []) or []
+            rows.extend(batch)
+            if max_rows is not None and len(rows) >= max_rows:
+                rows = rows[:max_rows]
+                break
+            if len(batch) < page:
+                break
+            offset += page
+            total = resp.get("total")
+            if total is not None and offset >= int(total):
+                break
+        return _rows_to_frame(rows, columns)
+
+
+# The async client is also reachable as ``EIA.AsyncAPI`` for parity with the
+# sync entry point (mirrors fedfred's ``FredAPI.AsyncAPI``).
+EIA.AsyncAPI = AsyncEIA
 
 
 # ---------------------------------------------------------------------- #
