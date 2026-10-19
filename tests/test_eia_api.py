@@ -15,8 +15,10 @@ from pathlib import Path
 from typing import Any
 
 import fire
+import httpx
 import pandas as pd
 import pytest
+import requests
 
 import eia_api.core as eia_core
 from eia_api.core import EIA, Route
@@ -460,6 +462,34 @@ def test_rate_limit_none_disables_throttle(monkeypatch: pytest.MonkeyPatch) -> N
     assert sleeps == []
 
 
+def test_default_session_sends_package_user_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session the client creates sends the package User-Agent, not requests'."""
+    eia = EIA(api_key="k", cache_dir="")
+    sent: list[str | bytes] = []
+
+    def _fake_send(prepared: requests.PreparedRequest, **_k: Any) -> _FakeResponse:
+        sent.append(prepared.headers["User-Agent"])
+        return _FakeResponse({"response": {}})
+
+    # Stub ``send`` rather than ``get`` so requests still merges the session's
+    # headers into the prepared request, exactly as it would on the wire.
+    monkeypatch.setattr(eia.session, "send", _fake_send)
+    eia._request("electricity", eia._params())
+    assert sent == [eia_core._USER_AGENT]
+
+
+def test_caller_session_headers_left_untouched() -> None:
+    """A caller-supplied session is used as-is: its User-Agent is not replaced."""
+    session = requests.Session()
+    session.headers["User-Agent"] = "my-proxy-agent/2.0"
+    before = dict(session.headers)
+    eia = EIA(api_key="k", cache_dir="", session=session)
+    assert eia.session is session
+    assert dict(session.headers) == before
+
+
 # --------------------------------------------------------------------------- #
 # Async client
 # --------------------------------------------------------------------------- #
@@ -489,6 +519,33 @@ def test_async_owns_client_by_default() -> None:
 def test_async_aclose_without_client_is_noop() -> None:
     """Closing before any request was made is a harmless no-op."""
     asyncio.run(eia_core.AsyncEIA(api_key="k", cache_dir="").aclose())
+
+
+def test_async_default_client_sends_package_user_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The lazily-created httpx client sends the package User-Agent too."""
+    eia = eia_core.AsyncEIA(api_key="k", cache_dir="")
+    sent: list[str] = []
+
+    async def _fake_send(
+        self: httpx.AsyncClient, request: httpx.Request, **_k: Any
+    ) -> httpx.Response:
+        """Record the outgoing User-Agent and return an empty envelope."""
+        sent.append(request.headers["User-Agent"])
+        return httpx.Response(200, json={"response": {}}, request=request)
+
+    # Patch the class's ``send`` because the client is only built inside
+    # ``_request``; ``get`` still merges the client headers into the request.
+    monkeypatch.setattr(httpx.AsyncClient, "send", _fake_send)
+
+    async def _run() -> None:
+        """Make one request, then close the client the request created."""
+        await eia._request("electricity", eia._params())
+        await eia.aclose()
+
+    asyncio.run(_run())
+    assert sent == [eia_core._USER_AGENT]
 
 
 def test_async_browse(monkeypatch: pytest.MonkeyPatch) -> None:
