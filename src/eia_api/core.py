@@ -92,8 +92,9 @@ _MAX_LENGTH = 5000
 # explicitly, so scripts need not hardcode the secret.
 _ENV_KEY = "EIA_API_KEY"
 
-# Some EIA endpoints reject requests lacking a browser-like User-Agent, so we
-# always send one to avoid being served an error page instead of JSON.
+# Some EIA endpoints reject requests lacking a browser-like User-Agent, so every
+# HTTP session or client this package creates sends this one, to avoid being
+# served an error page instead of JSON. Caller-supplied sessions are left as-is.
 _USER_AGENT = (
     "Mozilla/5.0 (compatible; eia-api-wrapper/1.0; +https://www.eia.gov/opendata/)"
 )
@@ -382,7 +383,10 @@ class EIA:
             the API; pass ``None`` to disable throttling entirely.
         session (requests.Session | None): Optional pre-configured session, for
             example one already set up to route through a corporate proxy. When
-            omitted a fresh session is created.
+            omitted a fresh session is created and given the package's
+            browser-like User-Agent. A supplied session is used exactly as
+            passed, its headers untouched, so set its User-Agent yourself if the
+            API rejects ``python-requests``.
     """
 
     # The pair of column families that are *not* part of a row's identity: the
@@ -409,8 +413,9 @@ class EIA:
 
         See the class docstring for a description of each argument. The
         constructor performs no network access; it only resolves the API key,
-        sets up the cache location and the HTTP session (adding a browser-like
-        User-Agent) and initialises the in-memory metadata cache.
+        sets up the cache location and the HTTP session and initialises the
+        in-memory metadata cache. Only a session the constructor creates itself
+        gets the browser-like User-Agent; a caller's session keeps its headers.
 
         Args:
             api_key (str | None): API key, or ``None`` to read ``EIA_API_KEY``.
@@ -420,7 +425,9 @@ class EIA:
             timeout (float): Per-request timeout in seconds.
             requests_per_second (float | None): Network-request throttle, or
                 ``None`` to disable it.
-            session (requests.Session | None): Optional pre-built HTTP session.
+            session (requests.Session | None): Optional pre-built HTTP session,
+                used as-is; when ``None`` a new one with the package User-Agent
+                is created.
         """
         # Fall back to the environment when no key is passed; validation is
         # deferred to the first network call so metadata-free use never trips.
@@ -438,9 +445,13 @@ class EIA:
         # Store the TTL in seconds because that is what ``time.time()`` returns.
         self.cache_ttl_seconds = cache_ttl_hours * 3600.0
         self.timeout = timeout
-        self.session = session or requests.Session()
-        # ``setdefault`` respects a User-Agent the caller may already have set.
-        self.session.headers.setdefault("User-Agent", _USER_AGENT)
+        if session is None:
+            session = requests.Session()
+            # Assign rather than ``setdefault``: a fresh session already carries
+            # requests' own ``python-requests/x.y`` User-Agent, so ``setdefault``
+            # would never apply ours. A caller's session is not modified.
+            session.headers["User-Agent"] = _USER_AGENT
+        self.session = session
 
         # Client-side throttle: keep at least this many seconds between network
         # requests (0.0 disables). ``_last_request_monotonic`` starts at 0.0 so

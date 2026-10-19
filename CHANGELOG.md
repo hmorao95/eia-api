@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   `{alias, units}` dict — e.g. the petroleum (`petroleum/pri/*`) and natural-gas
   (`natural-gas/pri/*`) price routes. Such columns are now listed with blank
   alias/units, so a bare `get_data("petroleum/pri/spt")` works.
+- `EIA` now actually sends its browser-like User-Agent. The constructor used
+  `session.headers.setdefault("User-Agent", ...)`, but a fresh
+  `requests.Session` already carries `python-requests/x.y`, so the default was
+  never applied and every request went out as `python-requests`. A session the
+  client creates now has the header set outright; a caller-supplied `session=` is
+  left untouched. `AsyncEIA` was not affected.
 
 ## [0.1.0] - 2026-09-13
 
