@@ -417,7 +417,7 @@ notes.
 If you use this wrapper in your work, please cite it (see
 [CITATION.cff](CITATION.cff); GitHub renders a "Cite this repository" button):
 
-> Morão, H. (2026). *eia-api* (v0.1.0) [Software].
+> Morão, H. (2026). *eia-api* (v0.2.0) [Software].
 > https://pypi.org/project/eia-api/
 
 Please also credit the underlying data source, the U.S. Energy Information
