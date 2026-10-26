@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- The README, the installation docs and `CITATION.cff` no longer point to PyPI,
+  where the package is not published: the PyPI badge and identifier are removed,
+  installation uses the GitHub repository, and the citation links to it.
+
 ## [0.2.0] - 2026-10-19
 
 ### Added

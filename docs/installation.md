@@ -2,14 +2,16 @@
 
 Requires Python 3.10 or newer.
 
+The package is not on PyPI yet, so install it from GitHub:
+
 ```bash
-pip install eia-api
+pip install git+https://github.com/hmorao95/eia-api.git
 ```
 
 Or, in a [uv](https://docs.astral.sh/uv/) project:
 
 ```bash
-uv add eia-api
+uv add git+https://github.com/hmorao95/eia-api.git
 ```
 
 ## API key
