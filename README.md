@@ -1,6 +1,5 @@
 # eia-api
 
-[![PyPI](https://img.shields.io/pypi/v/eia-api.svg)](https://pypi.org/project/eia-api/)
 [![CI](https://github.com/hmorao95/eia-api/actions/workflows/ci.yml/badge.svg)](https://github.com/hmorao95/eia-api/actions/workflows/ci.yml)
 [![Docs](https://github.com/hmorao95/eia-api/actions/workflows/docs.yml/badge.svg)](https://hmorao95.github.io/eia-api/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
@@ -83,10 +82,11 @@ with a directory (e.g. `data/price.csv` or an absolute path) to write elsewhere.
 
 See [Reference](#reference) for the full list of commands and options.
 
-To install the library into your own Python environment instead, use pip:
+To install the library into your own Python environment instead, install it
+from GitHub (it is not on PyPI yet):
 
 ```bash
-pip install eia-api
+pip install git+https://github.com/hmorao95/eia-api.git
 ```
 
 Requires Python 3.10 or newer.
@@ -418,7 +418,7 @@ If you use this wrapper in your work, please cite it (see
 [CITATION.cff](CITATION.cff); GitHub renders a "Cite this repository" button):
 
 > Morão, H. (2026). *eia-api* (v0.2.0) [Software].
-> https://pypi.org/project/eia-api/
+> https://github.com/hmorao95/eia-api
 
 Please also credit the underlying data source, the U.S. Energy Information
 Administration (EIA).

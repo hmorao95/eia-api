@@ -16,10 +16,6 @@ date-released: "2026-10-19"
 license: MIT
 repository-code: "https://github.com/hmorao95/eia-api"
 url: "https://github.com/hmorao95/eia-api"
-identifiers:
-  - type: url
-    value: "https://pypi.org/project/eia-api/"
-    description: "The package on the Python Package Index (PyPI)."
 keywords:
   - eia
   - energy
