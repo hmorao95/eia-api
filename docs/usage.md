@@ -107,6 +107,30 @@ async def main():
 gas, power = asyncio.run(main())
 ```
 
+## Caching
+
+Raw API responses are cached on disk for 24 hours (`cache_ttl_hours`). Where
+is set by `cache_dir`:
+
+| `cache_dir` | Cache |
+|---|---|
+| omitted, or `DEFAULT_CACHE_DIR` | `~/.cache/eia_api` (the home directory is looked up when the client is built) |
+| `None` (or `""`) | off: nothing is read from or written to disk |
+| a path | that directory (created if missing) |
+
+```python
+from eia_api import DEFAULT_CACHE_DIR, EIA
+
+EIA()  # ~/.cache/eia_api
+EIA(cache_dir=DEFAULT_CACHE_DIR)  # the same, explicitly
+EIA(cache_dir=None)  # no disk cache
+EIA(cache_dir="data/cache")  # a cache of your own
+```
+
+`AsyncEIA` takes the same values and shares the cache with `EIA`. On the
+command line the default directory is used; `--no-cache` (before or after the
+command) turns the cache off: `eia-api --no-cache browse`.
+
 ## Logging
 
 The library logs to the `eia_api` logger and stays silent until you attach a

@@ -68,6 +68,11 @@ wrong for a case, add a narrowly-scoped ignore with a comment explaining why.
   method (or `session.get`); never hit the network in tests.
 - **Secrets**: the API key is never logged, written to a file, or included in a
   cache filename (the cache key strips it out). Keep it that way.
+- **Cache directory**: every client's `cache_dir` defaults to the
+  `DEFAULT_CACHE_DIR` sentinel, which `_resolve_cache_dir` maps to
+  `~/.cache/eia_api` when the client is built (never at import); `None` (or
+  any falsy value) disables the disk cache. Internal code that wants no cache
+  passes `cache_dir=None` (as the CLI's `--no-cache` does).
 - **Line length**: formatter targets 88; `E501` allows up to 150.
 - **Imports**: fire is imported lazily inside `main()` on purpose.
 
@@ -77,6 +82,9 @@ wrong for a case, add a narrowly-scoped ignore with a comment explaining why.
   or stub `session.get` with a fake response. See the `client` fixture and
   `_fake_request` in `tests/test_eia_api.py`.
 - CLI tests drive fire directly: `fire.Fire(cli, command=[...])`.
+- Tests never touch the real home directory: the autouse `home` fixture in
+  `tests/conftest.py` points `Path.home()` at a fresh temporary directory for
+  every test (request `home` to inspect it).
 - Add tests for every new behavior; keep coverage healthy.
 
 ## Dependencies

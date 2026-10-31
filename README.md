@@ -337,6 +337,7 @@ folder; pass a path with a directory to write elsewhere.
 | `--length` | int (≤ 5000) | Page size per request. Pagination is automatic. |
 | `--max-rows` | int | Stop after this many rows. |
 | `--tidy` | flag | Use the [tidy shape](#tidy-output) (`date`, dimensions, `variable`, `value`, `unit`). |
+| `--no-cache` | flag | Do not read or write the on-disk response cache (see [Caching](#caching)). Works with any command. |
 | `--log-level` | `debug`, `info`, `warning`, `error` | Console log threshold (default `warning`); log lines go to stderr. Works with any command. |
 | `--log-file` | path | Append a full DEBUG log with timestamps. Works with any command. |
 
@@ -345,7 +346,7 @@ folder; pass a path with a directory to write elsewhere.
 ```python
 EIA(
     api_key=None,
-    cache_dir=None,
+    cache_dir=DEFAULT_CACHE_DIR,  # ~/.cache/eia_api; None disables caching
     cache_ttl_hours=24.0,
     timeout=60.0,
     requests_per_second=9.0,
@@ -380,6 +381,30 @@ The `to_*` writers and `update_csv` forward `**kwargs` (including `tidy=True`)
 to `get_data`. The default output columns are `date`, `period`, the facet
 columns, and each requested value column plus its `<column>-units` companion;
 see [Tidy output](#tidy-output) for the `tidy=True` shape.
+
+### Caching
+
+Raw API responses are cached on disk for 24 hours (`cache_ttl_hours`). Where
+is set by `cache_dir`:
+
+| `cache_dir` | Cache |
+|---|---|
+| omitted, or `DEFAULT_CACHE_DIR` | `~/.cache/eia_api` (the home directory is looked up when the client is built) |
+| `None` (or `""`) | off: nothing is read from or written to disk |
+| a path | that directory (created if missing) |
+
+```python
+from eia_api import DEFAULT_CACHE_DIR, EIA
+
+EIA()  # ~/.cache/eia_api
+EIA(cache_dir=DEFAULT_CACHE_DIR)  # the same, explicitly
+EIA(cache_dir=None)  # no disk cache
+EIA(cache_dir="data/cache")  # a cache of your own
+```
+
+`AsyncEIA` takes the same values and shares the cache with `EIA`. On the
+command line the default directory is used; `--no-cache` (before or after the
+command) turns the cache off: `eia-api --no-cache browse`.
 
 ## Incremental updates
 
