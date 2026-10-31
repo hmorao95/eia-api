@@ -2719,6 +2719,66 @@ class _Cli:
         return f"Wrote {len(changed):,} new/revised rows -> {path}"
 
 
+#: A quoted string literal (group 1, left alone) or a bare word that starts with
+#: a zero followed by a digit (group 2), such as the generator id ``01``.
+_LEADING_ZERO_WORD = re.compile(
+    r"""("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')|(?<![\w.])(0\d[\w.]*)"""
+)
+
+
+def _facets_literal(value: str) -> object:
+    """
+    Parse a ``--facets`` argument, keeping leading-zero codes as text.
+
+    This is the python-fire parse function for ``facets``. Fire reads the
+    argument as a Python literal with bare words allowed (``{stateid: CO}``),
+    but a bare code with a leading zero breaks that: ``{generatorid: 01}`` is
+    not valid Python, so Fire gave up and passed the whole text on as a string,
+    and ``{generatorid: 00}`` became the int ``0``. Such words are quoted first,
+    so they arrive as ``"01"`` and ``"00"``. Quoted values and other numbers
+    (``{sectorid: [1, 2]}``) parse as before.
+
+    Args:
+        value (str): The argument's raw command-line text.
+
+    Returns:
+        object: The parsed value, normally a facet mapping.
+    """
+    from fire import parser  # Imported lazily so the library does not load Fire.
+
+    quoted = _LEADING_ZERO_WORD.sub(
+        lambda match: match.group(1) or repr(match.group(2)), value
+    )
+    return parser.DefaultParseValue(quoted)
+
+
+#: CLI parameters that carry codes, and the parse function that keeps them.
+_CODE_PARSERS = {"facets": _facets_literal}
+
+
+def _keep_codes_as_text() -> None:
+    """
+    Make the CLI keep the leading zeros of facet codes.
+
+    Registers the parse functions in :data:`_CODE_PARSERS` with python-fire on
+    every :class:`_Cli` command that takes such a parameter, however the value
+    is given: ``--facets VALUE``, ``--facets=VALUE`` or positionally. Fire stores
+    the setting on the method itself, so calling this again is harmless.
+    :func:`main` calls it; tests that drive Fire directly call it too.
+    """
+    import inspect  # Finds the commands that take a code parameter.
+
+    import fire  # Imported lazily so the library does not load Fire.
+
+    for name in dir(_Cli):
+        command = getattr(_Cli, name)
+        if name.startswith("_") or not inspect.isfunction(command):
+            continue
+        params = inspect.signature(command).parameters
+        if parsers := {k: fn for k, fn in _CODE_PARSERS.items() if k in params}:
+            fire.decorators.SetParseFns(**parsers)(command)
+
+
 def main() -> None:
     """
     Run the Fire-generated command-line interface.
@@ -2741,6 +2801,7 @@ def main() -> None:
     # CLI is actually invoked.
     import fire
 
+    _keep_codes_as_text()
     try:
         fire.Fire(_Cli, name="eia-api")
     except (ValueError, RuntimeError, requests.RequestException) as exc:
