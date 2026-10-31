@@ -276,7 +276,7 @@ folder; pass a path with a directory to write elsewhere.
 |---|---|---|
 | `--route` | e.g. `electricity/retail-sales` | Dataset path (browse to find it). A trailing `/data` is optional. |
 | `--data` | name or list of names | Value column(s) to return. Omit for all (see `data-columns`). |
-| `--facets` | JSON mapping | Facet filters, e.g. `'{"stateid": "CO", "sectorid": ["RES", "COM"]}'`. |
+| `--facets` | JSON mapping | Facet filters, e.g. `'{"stateid": "CO", "sectorid": ["RES", "COM"]}'`. Codes keep their leading zeros, quoted or not: `'{generatorid: 01}'` filters on `01`. |
 | `--frequency` | e.g. `monthly`, `annual`, `daily` | Periodicity (see `frequencies`). |
 | `--start`, `--end` | e.g. `2015`, `2015-01`, `2015-01-01` | Inclusive period bounds. |
 | `--length` | int (≤ 5000) | Page size per request. Pagination is automatic. |

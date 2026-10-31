@@ -117,3 +117,6 @@ eia-api facets electricity/retail-sales
 eia-api to-csv price.csv --route electricity/retail-sales --data price --frequency monthly
 eia-api --help
 ```
+
+Facet codes keep their leading zeros, quoted or not: `--facets '{generatorid: 01}'`
+filters on the generator id `01`.
