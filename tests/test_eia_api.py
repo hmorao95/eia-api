@@ -9,10 +9,11 @@ stubbing the ``requests.Session`` used underneath it.
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import fire
 import httpx
@@ -22,6 +23,9 @@ import requests
 
 import eia_api.core as eia_core
 from eia_api.core import EIA, Route
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 # --------------------------------------------------------------------------- #
 # Fixtures / helpers
@@ -150,6 +154,9 @@ def _fake_request(endpoint: str, params: list[tuple[str, str]]) -> dict[str, Any
 
 class _FakeResponse:
     """Minimal stand-in for a :class:`requests.Response`."""
+
+    # Read by the client's debug log line after each request.
+    status_code = 200
 
     def __init__(self, payload: dict[str, Any]) -> None:
         """Store the canned JSON ``payload``."""
@@ -940,6 +947,188 @@ def test_cli_reports_errors_cleanly(
         eia_core.main()
     assert excinfo.value.code == 1
     assert "Error: No EIA API key" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# Logging
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(autouse=True)
+def _reset_package_logger() -> Iterator[None]:
+    """Undo any CLI logging setup a test made, so tests stay independent."""
+    yield
+    log = logging.getLogger("eia_api")
+    for handler in list(log.handlers):
+        if getattr(handler, eia_core._CLI_HANDLER_FLAG, False):
+            log.removeHandler(handler)
+            handler.close()
+    log.setLevel(logging.NOTSET)
+
+
+def test_request_logs_without_the_key(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Request, cache and status lines are logged, and the key never is."""
+    canary = "super-canary-key-123"
+    eia = EIA(api_key=canary, cache_dir="", requests_per_second=None)
+    monkeypatch.setattr(
+        eia.session, "get", lambda *a, **k: _FakeResponse({"response": {}})
+    )
+    with caplog.at_level(logging.DEBUG, logger="eia_api"):
+        eia.metadata("electricity")
+    assert "GET electricity" in caplog.text
+    assert "HTTP 200 for electricity" in caplog.text
+    assert canary not in caplog.text
+
+
+def test_cache_hit_is_logged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A response served from the disk cache says so at DEBUG."""
+    eia = EIA(api_key="k", cache_dir=tmp_path, requests_per_second=None)
+    monkeypatch.setattr(
+        eia.session, "get", lambda *a, **k: _FakeResponse({"response": {}})
+    )
+    eia._request("electricity", eia._params())
+    with caplog.at_level(logging.DEBUG, logger="eia_api"):
+        eia._request("electricity", eia._params())
+    assert "Cache hit: electricity" in caplog.text
+
+
+@pytest.mark.parametrize("logger_name", ["urllib3.connectionpool", "httpx"])
+def test_http_library_logs_are_redacted(
+    logger_name: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """URLs that urllib3/httpx log with the key in the query come out masked."""
+    canary = "another-canary-456"
+    EIA(api_key=canary, cache_dir="")
+    with caplog.at_level(logging.DEBUG, logger=logger_name):
+        logging.getLogger(logger_name).info(
+            "GET https://api.eia.gov/v2/?api_key=%s", canary
+        )
+    assert canary not in caplog.text
+    assert "api_key=***" in caplog.text
+
+
+def test_get_data_logs_summary(client: EIA, caplog: pytest.LogCaptureFixture) -> None:
+    """get_data reports rows and pages at INFO, each page at DEBUG."""
+    with caplog.at_level(logging.DEBUG, logger="eia_api"):
+        client.get_data("electricity/retail-sales", data="price", length=2)
+    assert "Fetched 3 rows from electricity/retail-sales in 2 page(s)" in caplog.text
+    assert "page 2, 1 rows" in caplog.text
+
+
+def test_async_get_data_logs_summary(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The async client logs the same INFO summary as the sync one."""
+    aeia = _async_client(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="eia_api"):
+        asyncio.run(aeia.get_data("electricity/retail-sales", data="price"))
+    assert "Fetched 3 rows from electricity/retail-sales" in caplog.text
+
+
+def test_update_csv_logs_each_outcome(
+    client: EIA, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """update_csv logs creating, then finding nothing new."""
+    path = tmp_path / "prices.csv"
+    with caplog.at_level(logging.INFO, logger="eia_api"):
+        client.update_csv(path, route="electricity/retail-sales", data="price")
+        client.update_csv(path, route="electricity/retail-sales", data="price")
+    assert f"Created {path} with 3 rows" in caplog.text
+    assert f"{path} is already up to date" in caplog.text
+
+
+def test_configure_logging_rejects_unknown_level() -> None:
+    """A misspelled level is a clear error, not a silent default."""
+    with pytest.raises(ValueError, match="log_level must be one of"):
+        eia_core._configure_logging("loud")
+
+
+def test_configure_logging_does_not_stack_handlers() -> None:
+    """Reconfiguring replaces the CLI handlers instead of adding more."""
+    eia_core._configure_logging("INFO")
+    eia_core._configure_logging("DEBUG")
+    log = logging.getLogger("eia_api")
+    ours = [h for h in log.handlers if getattr(h, eia_core._CLI_HANDLER_FLAG, False)]
+    assert len(ours) == 1
+    assert log.level == logging.DEBUG
+
+
+def test_configure_logging_console_goes_to_stderr(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Console log lines go to stderr so stdout stays pipeable."""
+    eia_core._configure_logging("INFO")
+    logging.getLogger("eia_api").info("hello from the log")
+    captured = capsys.readouterr()
+    assert "hello from the log" in captured.err
+    assert "hello from the log" not in captured.out
+
+
+def test_configure_logging_file_gets_debug(tmp_path: Path) -> None:
+    """The log file records DEBUG lines even when the console is quieter."""
+    log_file = tmp_path / "run.log"
+    eia_core._configure_logging("WARNING", str(log_file))
+    logging.getLogger("eia_api").debug("detail for the file")
+    text = log_file.read_text(encoding="utf-8")
+    assert "eia_api - DEBUG - detail for the file" in text
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["--log-level", "info", "browse"],
+        ["browse", "--log-level", "info"],
+    ],
+)
+def test_cli_log_level_flag(
+    command: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--log-level works before or after the subcommand."""
+    monkeypatch.setattr(EIA, "_request", lambda _self, e, p: _fake_request(e, p))
+    monkeypatch.setenv("EIA_API_KEY", "k")
+    out = fire.Fire(eia_core._Cli, command=command)
+    assert "electricity" in out
+    assert logging.getLogger("eia_api").level == logging.INFO
+    # Log lines (none at INFO for browse) never land on stdout.
+    assert "INFO" not in capsys.readouterr().out
+
+
+def test_redaction_masks_registered_key_outside_urls(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A registered key is masked even when it is not in a query string."""
+    canary = "plain-text-canary-789"
+    EIA(api_key=canary, cache_dir="")
+    with caplog.at_level(logging.DEBUG, logger="eia_api"):
+        logging.getLogger("eia_api").debug("oops, key was %s", canary)
+    assert canary not in caplog.text
+    assert "oops, key was ***" in caplog.text
+
+
+def test_short_keys_are_not_registered() -> None:
+    """A tiny key is not masked as plain text, which would mangle other words."""
+    EIA(api_key="k", cache_dir="")
+    assert "k" not in eia_core._REDACT_FILTER.secrets
+
+
+def test_main_writes_traceback_to_log_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """On an expected error the log file keeps the full traceback."""
+    log_file = tmp_path / "eia.log"
+    monkeypatch.setattr(sys, "argv", ["eia-api", "--log-file", str(log_file), "browse"])
+    monkeypatch.delenv("EIA_API_KEY", raising=False)
+    with pytest.raises(SystemExit):
+        eia_core.main()
+    text = log_file.read_text(encoding="utf-8")
+    assert "Command failed" in text
+    assert "Traceback" in text
 
 
 # --------------------------------------------------------------------------- #

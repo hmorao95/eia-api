@@ -281,6 +281,8 @@ folder; pass a path with a directory to write elsewhere.
 | `--start`, `--end` | e.g. `2015`, `2015-01`, `2015-01-01` | Inclusive period bounds. |
 | `--length` | int (≤ 5000) | Page size per request. Pagination is automatic. |
 | `--max-rows` | int | Stop after this many rows. |
+| `--log-level` | `debug`, `info`, `warning`, `error` | Console log threshold (default `warning`); log lines go to stderr. Works with any command. |
+| `--log-file` | path | Append a full DEBUG log with timestamps. Works with any command. |
 
 ### Python API
 
@@ -360,6 +362,36 @@ missing = eia.new_observations(
     have, route="electricity/retail-sales", data="price", include_revisions=False
 )
 ```
+
+## Logging
+
+The library logs to the `eia_api` logger and stays silent until you attach a
+handler. Requests, cache hits, throttle sleeps and each page go out at `DEBUG`;
+one summary line per fetch, export or incremental update goes out at `INFO`. The
+API key is never logged: it is left out of the package's own lines, and masked
+as `***` in the URLs that `urllib3` and `httpx` log.
+
+```python
+import logging
+
+logging.basicConfig(format="%(asctime)s %(name)s %(levelname)s %(message)s")
+logging.getLogger("eia_api").setLevel(logging.INFO)
+```
+
+On the command line, two flags work with any command (before or after it):
+
+```bash
+# Colored log lines on stderr; stdout keeps only the command's output
+eia-api get-data electricity/retail-sales --data price --log-level info
+
+# Also append a full DEBUG log with timestamps (bare names go to outputs/)
+eia-api update-csv price.csv --route electricity/retail-sales --data price     --log-file eia.log
+```
+
+`--log-level` takes `debug`, `info`, `warning` (the default, which keeps the
+CLI quiet) or `error`. When a command fails, the short error is printed as before
+and the full traceback goes to the log (visible with `--log-level debug`, always
+kept in `--log-file`).
 
 ## Development
 

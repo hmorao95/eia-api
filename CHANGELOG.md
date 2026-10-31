@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Logging: the library now logs to the `eia_api` logger (silent by default via a
+  `NullHandler`). Requests, cache hits and expiries, throttle sleeps and each
+  page are logged at DEBUG; a summary per fetch, export and incremental update
+  at INFO. Both clients log the same lines.
+- CLI flags `--log-level` (colored console output on stderr, via `colorlog`) and
+  `--log-file` (appends a full DEBUG log with timestamps), accepted with any
+  command. On a failed command the traceback goes to the log.
+- The API key is masked as `***` in log records from `urllib3` and `httpx`
+  (which log full request URLs) and from the package logger.
+
 ### Fixed
 
 - The README, the installation docs and `CITATION.cff` no longer point to PyPI,
