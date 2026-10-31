@@ -1,0 +1,19 @@
+# Dependabot opens monthly grouped PRs for the uv dependencies and for the
+# GitHub Actions used in the workflows. Security updates arrive as soon as an
+# advisory is published, independent of this schedule.
+version: 2
+updates:
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      python:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
