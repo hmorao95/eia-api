@@ -412,7 +412,7 @@ def test_get_data_empty_returns_empty(
 
 def test_request_raises_on_api_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """A top-level ``error`` field becomes a clear RuntimeError."""
-    eia = EIA(api_key="bad", cache_dir="")  # "" disables cache; None = default dir
+    eia = EIA(api_key="bad", cache_dir=None)  # None disables the disk cache
     payload = {"error": "invalid or missing api_key", "code": 403}
     monkeypatch.setattr(eia.session, "get", lambda *a, **k: _FakeResponse(payload))
     with pytest.raises(RuntimeError, match="invalid or missing api_key"):
@@ -1716,3 +1716,201 @@ def test_cli_update_csv_tidy(cli: eia_core._Cli, tmp_path: Path) -> None:
     assert "3 new/revised rows" in fire.Fire(cli, command=command)
     assert "unit" in pd.read_csv(out).columns
     assert "0 new/revised rows" in fire.Fire(cli, command=command)
+
+
+# --------------------------------------------------------------------------- #
+# cache_dir: DEFAULT_CACHE_DIR (the default) versus None (no cache)
+# --------------------------------------------------------------------------- #
+
+_CLIENT_CLASSES = [EIA, eia_core.AsyncEIA]
+_ClientClass = type[EIA] | type[eia_core.AsyncEIA]
+
+
+def test_default_cache_dir_is_exported() -> None:
+    """The sentinel is public, and it is the constructors' default."""
+    import eia_api
+
+    assert eia_api.DEFAULT_CACHE_DIR is eia_core.DEFAULT_CACHE_DIR
+    assert "DEFAULT_CACHE_DIR" in eia_api.__all__
+    assert repr(eia_api.DEFAULT_CACHE_DIR) == "DEFAULT_CACHE_DIR"
+
+
+@pytest.mark.parametrize("cls", _CLIENT_CLASSES)
+def test_no_cache_dir_argument_uses_default_dir(cls: _ClientClass, home: Path) -> None:
+    """Omitting ``cache_dir`` caches under ``~/.cache/eia_api`` (patched home)."""
+    client = cls(api_key="k")
+    assert client.cache_dir == home / ".cache" / "eia_api"
+    assert client.cache_dir.is_dir()
+
+
+@pytest.mark.parametrize("cls", _CLIENT_CLASSES)
+def test_default_cache_dir_sentinel_uses_default_dir(
+    cls: _ClientClass, home: Path
+) -> None:
+    """Passing ``DEFAULT_CACHE_DIR`` explicitly is the same as omitting it."""
+    client = cls(api_key="k", cache_dir=eia_core.DEFAULT_CACHE_DIR)
+    assert client.cache_dir == home / ".cache" / "eia_api"
+
+
+def test_default_cache_dir_resolved_per_client(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The home directory is looked up when a client is built, not at import."""
+    for name in ("first", "second"):
+        monkeypatch.setattr(Path, "home", lambda name=name: tmp_path / name)
+        assert EIA(api_key="k").cache_dir == tmp_path / name / ".cache" / "eia_api"
+
+
+@pytest.mark.parametrize("cls", _CLIENT_CLASSES)
+@pytest.mark.parametrize("off", [None, ""])
+def test_none_or_empty_cache_dir_disables_cache(
+    cls: _ClientClass, off: str | None, home: Path
+) -> None:
+    """``None`` (and, as before, ``""``) turns the cache off: no dir is created."""
+    assert cls(api_key="k", cache_dir=off).cache_dir is None
+    assert not any(home.iterdir())
+
+
+@pytest.mark.parametrize("cls", _CLIENT_CLASSES)
+def test_explicit_cache_dir_is_used(
+    cls: _ClientClass, tmp_path: Path, home: Path
+) -> None:
+    """A path (``str`` or ``Path``) is used as given and created."""
+    target = tmp_path / "explicit"
+    assert cls(api_key="k", cache_dir=target).cache_dir == target
+    assert cls(api_key="k", cache_dir=str(target)).cache_dir == target
+    assert target.is_dir()
+    assert not any(home.iterdir())
+
+
+_PAYLOAD = {"response": {"id": "electricity", "routes": []}}
+
+
+def _sync_fetch_twice(monkeypatch: pytest.MonkeyPatch, eia: EIA) -> int:
+    """Make the same request twice through a stub session; return HTTP calls."""
+    calls: list[int] = []
+
+    def _fake_get(*_a: Any, **_k: Any) -> _FakeResponse:
+        """Count the call and return the canned envelope."""
+        calls.append(1)
+        return _FakeResponse(_PAYLOAD)
+
+    monkeypatch.setattr(eia.session, "get", _fake_get)
+    for _ in range(2):
+        assert eia._request("electricity", eia._params()) == _PAYLOAD["response"]
+    return len(calls)
+
+
+def _async_fetch_twice(monkeypatch: pytest.MonkeyPatch, eia: eia_core.AsyncEIA) -> int:
+    """Make the same async request twice through a stub transport; count sends."""
+    calls: list[int] = []
+
+    async def _fake_send(
+        _self: httpx.AsyncClient, request: httpx.Request, **_k: Any
+    ) -> httpx.Response:
+        """Count the call and return the canned envelope."""
+        calls.append(1)
+        return httpx.Response(200, json=_PAYLOAD, request=request)
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", _fake_send)
+
+    async def _run() -> None:
+        """Request twice, then close the lazily-created client."""
+        for _ in range(2):
+            assert (
+                await eia._request("electricity", eia._params()) == _PAYLOAD["response"]
+            )
+        await eia.aclose()
+
+    asyncio.run(_run())
+    return len(calls)
+
+
+def test_sync_cache_dir_none_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, home: Path
+) -> None:
+    """With ``cache_dir=None`` every call hits the network and nothing is written."""
+    eia = EIA(api_key="k", cache_dir=None, requests_per_second=None)
+    assert _sync_fetch_twice(monkeypatch, eia) == 2
+    assert not any(home.rglob("*"))
+
+
+def test_sync_default_cache_writes_under_home(
+    monkeypatch: pytest.MonkeyPatch, home: Path
+) -> None:
+    """By default the response is cached in the default dir and reused."""
+    eia = EIA(api_key="k", requests_per_second=None)
+    assert _sync_fetch_twice(monkeypatch, eia) == 1
+    assert len(list((home / ".cache" / "eia_api").glob("*.json"))) == 1
+
+
+def test_async_cache_dir_none_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, home: Path
+) -> None:
+    """The async client with ``cache_dir=None`` writes no cache either."""
+    eia = eia_core.AsyncEIA(api_key="k", cache_dir=None, requests_per_second=None)
+    assert _async_fetch_twice(monkeypatch, eia) == 2
+    assert not any(home.rglob("*"))
+
+
+def test_async_default_cache_writes_under_home(
+    monkeypatch: pytest.MonkeyPatch, home: Path
+) -> None:
+    """The async client caches in the default dir by default."""
+    eia = eia_core.AsyncEIA(api_key="k", requests_per_second=None)
+    assert _async_fetch_twice(monkeypatch, eia) == 1
+    assert len(list((home / ".cache" / "eia_api").glob("*.json"))) == 1
+
+
+@pytest.mark.parametrize(
+    ("command", "cached"),
+    [
+        (["browse"], True),
+        (["--no-cache", "browse"], False),
+        (["--no_cache", "browse"], False),
+        (["browse", "--no-cache"], False),
+        (["--log-level", "INFO", "--no-cache", "browse"], False),
+        (["--no-cache", "--log-level", "INFO", "browse"], False),
+    ],
+)
+def test_cli_caches_by_default_and_no_cache_disables(
+    command: list[str],
+    cached: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    home: Path,
+) -> None:
+    """The CLI caches in the default dir unless ``--no-cache`` (anywhere) is given."""
+    monkeypatch.setenv("EIA_API_KEY", "k")
+    built: list[EIA] = []
+
+    class _Recording(EIA):
+        """An :class:`EIA` that records each instance the CLI builds."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            """Build the client as usual, then remember it."""
+            super().__init__(*args, **kwargs)
+            built.append(self)
+
+    monkeypatch.setattr(eia_core, "EIA", _Recording)
+    monkeypatch.setattr(
+        EIA, "_request", lambda _self, endpoint, params: _fake_request(endpoint, params)
+    )
+    monkeypatch.setattr(sys, "argv", ["eia-api", *command])
+    eia_core.main()
+    assert "electricity" in capsys.readouterr().out
+    (client,) = built
+    default = home / ".cache" / "eia_api"
+    assert client.cache_dir == (default if cached else None)
+    assert default.is_dir() is cached
+
+
+def test_bind_no_cache_flag_leaves_fire_flags_alone() -> None:
+    """Only bare ``--no-cache`` before ``--`` is rewritten."""
+    argv = ["--no-cache", "browse", "--", "--no-cache"]
+    assert eia_core._bind_no_cache_flag(argv) == [
+        "--no_cache=True",
+        "browse",
+        "--",
+        "--no-cache",
+    ]

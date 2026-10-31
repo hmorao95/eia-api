@@ -58,6 +58,7 @@ from __future__ import (  # Enables modern (PEP 604 / postponed) annotations.
 )
 
 import asyncio  # Backs the async client's non-blocking throttle sleep.
+import enum  # Builds the DEFAULT_CACHE_DIR sentinel type.
 import hashlib  # Derives the on-disk cache filename from the request signature.
 import json  # Serialises the cache key and reads/writes cached JSON payloads.
 import logging  # Reports requests, cache hits and progress; redacts the key.
@@ -195,6 +196,58 @@ def _loggable(params: Sequence[tuple[str, str]]) -> str:
         str: ``name=value`` pairs joined by ``&``, with ``api_key`` left out.
     """
     return "&".join(f"{k}={v}" for k, v in params if k != "api_key")
+
+
+class _DefaultCacheDir(enum.Enum):
+    """
+    Type of :data:`DEFAULT_CACHE_DIR`, the "use the default cache" marker.
+
+    A one-member enum rather than a ready-made path, so that the default
+    directory (``~/.cache/eia_api``) is resolved when a client is constructed, not
+    when the module is imported: a changed home directory (or a test patching
+    :meth:`pathlib.Path.home`) is honoured. Being an enum member, it is a
+    distinct value that type checkers can narrow on, and it can never be
+    confused with ``None``, which means "no on-disk cache".
+    """
+
+    DEFAULT_CACHE_DIR = "DEFAULT_CACHE_DIR"
+
+    def __repr__(self) -> str:
+        """
+        Return the public name, so signatures read ``cache_dir=DEFAULT_CACHE_DIR``.
+
+        Returns:
+            str: The literal ``"DEFAULT_CACHE_DIR"``.
+        """
+        return "DEFAULT_CACHE_DIR"
+
+
+#: Default value of every ``cache_dir`` argument: cache responses in
+#: ``~/.cache/eia_api`` (the home directory is looked up when the client is
+#: built). Pass ``cache_dir=None`` (or ``""``) instead to disable the on-disk
+#: cache, or any path to use that directory.
+DEFAULT_CACHE_DIR = _DefaultCacheDir.DEFAULT_CACHE_DIR
+
+
+def _resolve_cache_dir(cache_dir: str | Path | _DefaultCacheDir | None) -> Path | None:
+    """
+    Turn a ``cache_dir`` argument into the cache directory to use, if any.
+
+    :data:`DEFAULT_CACHE_DIR` maps to ``~/.cache/eia_api`` under the *current*
+    home directory; ``None`` and any other falsy value (such as ``""``) disable
+    the on-disk cache; anything else is taken as the directory path. Nothing is
+    created here; the clients create the directory themselves.
+
+    Args:
+        cache_dir (str | Path | _DefaultCacheDir | None): The value passed to a
+            client constructor.
+
+    Returns:
+        Path | None: The cache directory, or ``None`` when caching is off.
+    """
+    if isinstance(cache_dir, _DefaultCacheDir):
+        return Path.home() / ".cache" / "eia_api"
+    return Path(cache_dir) if cache_dir else None
 
 
 def _cache_path(
@@ -668,9 +721,10 @@ class EIA:
             environment variable is used; if neither is set, calls that hit the
             network raise :class:`ValueError`. Register for a free key at
             https://www.eia.gov/opendata/.
-        cache_dir (str | Path | None): Directory used to cache raw JSON API
-            responses. Defaults to ``~/.cache/eia_api``. Pass a falsy value to
-            disable on-disk caching entirely.
+        cache_dir (str | Path | _DefaultCacheDir | None): Directory used to
+            cache raw API responses. The default, :data:`~eia_api.DEFAULT_CACHE_DIR`,
+            means ``~/.cache/eia_api`` (resolved when the client is built).
+            ``None`` (or ``""``) disables the on-disk cache.
         cache_ttl_hours (float): How long a cached response is considered fresh.
             Most EIA series update daily at most, so the 24-hour default rarely
             serves stale data while still avoiding needless requests.
@@ -701,7 +755,7 @@ class EIA:
     def __init__(
         self,
         api_key: str | None = None,
-        cache_dir: str | Path | None = None,
+        cache_dir: str | Path | _DefaultCacheDir | None = DEFAULT_CACHE_DIR,
         cache_ttl_hours: float = 24.0,
         timeout: float = 60.0,
         requests_per_second: float | None = 9.0,
@@ -718,8 +772,9 @@ class EIA:
 
         Args:
             api_key (str | None): API key, or ``None`` to read ``EIA_API_KEY``.
-            cache_dir (str | Path | None): Where to cache responses, or a falsy
-                value to disable disk caching.
+            cache_dir (str | Path | _DefaultCacheDir | None): Cache directory;
+                :data:`~eia_api.DEFAULT_CACHE_DIR` for ``~/.cache/eia_api``, ``None``
+                (or ``""``) to disable disk caching.
             cache_ttl_hours (float): Freshness window for cached responses.
             timeout (float): Per-request timeout in seconds.
             requests_per_second (float | None): Network-request throttle, or
@@ -733,11 +788,9 @@ class EIA:
         self.api_key = api_key or os.environ.get(_ENV_KEY)
         _register_secret(self.api_key)
 
-        # A literal ``None`` means "use the default per-user cache directory";
-        # any other falsy value (e.g. "") disables caching below.
-        if cache_dir is None:
-            cache_dir = Path.home() / ".cache" / "eia_api"
-        self.cache_dir = Path(cache_dir) if cache_dir else None
+        # DEFAULT_CACHE_DIR means ~/.cache/eia_api (resolved now, not at import);
+        # ``None`` or any other falsy value (e.g. "") disables disk caching.
+        self.cache_dir = _resolve_cache_dir(cache_dir)
         # Create the directory up front so later writes never race on it.
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1760,9 +1813,10 @@ class AsyncEIA:
 
     Args:
         api_key (str | None): EIA API key; falls back to ``EIA_API_KEY``.
-        cache_dir (str | Path | None): Response cache directory; ``None`` uses the
-            default ``~/.cache/eia_api`` (shared with :class:`EIA`), any other
-            falsy value disables caching.
+        cache_dir (str | Path | _DefaultCacheDir | None): Directory used to
+            cache raw API responses. The default, :data:`~eia_api.DEFAULT_CACHE_DIR`,
+            means ``~/.cache/eia_api`` (resolved when the client is built).
+            ``None`` (or ``""``) disables the on-disk cache.
         cache_ttl_hours (float): Freshness window for cached responses.
         timeout (float): Per-request timeout in seconds.
         requests_per_second (float | None): Network-request throttle, or ``None``
@@ -1774,7 +1828,7 @@ class AsyncEIA:
     def __init__(
         self,
         api_key: str | None = None,
-        cache_dir: str | Path | None = None,
+        cache_dir: str | Path | _DefaultCacheDir | None = DEFAULT_CACHE_DIR,
         cache_ttl_hours: float = 24.0,
         timeout: float = 60.0,
         requests_per_second: float | None = 9.0,
@@ -1785,8 +1839,9 @@ class AsyncEIA:
 
         Args:
             api_key (str | None): API key, or ``None`` to read ``EIA_API_KEY``.
-            cache_dir (str | Path | None): Cache directory, or a falsy value to
-                disable disk caching.
+            cache_dir (str | Path | _DefaultCacheDir | None): Cache directory;
+                :data:`~eia_api.DEFAULT_CACHE_DIR` for ``~/.cache/eia_api``, ``None``
+                (or ``""``) to disable disk caching.
             cache_ttl_hours (float): Freshness window for cached responses.
             timeout (float): Per-request timeout in seconds.
             requests_per_second (float | None): Network-request throttle, or
@@ -1795,9 +1850,7 @@ class AsyncEIA:
         """
         self.api_key = api_key or os.environ.get(_ENV_KEY)
         _register_secret(self.api_key)
-        if cache_dir is None:
-            cache_dir = Path.home() / ".cache" / "eia_api"
-        self.cache_dir = Path(cache_dir) if cache_dir else None
+        self.cache_dir = _resolve_cache_dir(cache_dir)
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.cache_ttl_seconds = cache_ttl_hours * 3600.0
@@ -2316,10 +2369,15 @@ class _Cli:
     and print its attributes instead of the data.
 
     The constructor's parameters become global flags, accepted with any
-    command: ``--log-level`` and ``--log-file``.
+    command: ``--no-cache``, ``--log-level`` and ``--log-file``.
     """
 
-    def __init__(self, log_level: str = "WARNING", log_file: str | None = None) -> None:
+    def __init__(
+        self,
+        log_level: str = "WARNING",
+        log_file: str | None = None,
+        no_cache: bool = False,
+    ) -> None:
         """
         Set up CLI logging and a default :class:`EIA` client.
 
@@ -2331,9 +2389,11 @@ class _Cli:
                 stderr, so command output on stdout stays clean.
             log_file (str | None): Append a full DEBUG log with timestamps to
                 this file. A bare filename is written into ``outputs/``.
+            no_cache (bool): Disable the on-disk response cache (``--no-cache``);
+                by default responses are cached in the default directory.
         """
         _configure_logging(log_level, self._resolve_out(log_file) if log_file else None)
-        self._eia = EIA()
+        self._eia = EIA(cache_dir=None) if no_cache else EIA()
 
     def browse(self, route: str = "") -> str:
         """
@@ -2779,6 +2839,31 @@ def _keep_codes_as_text() -> None:
             fire.decorators.SetParseFns(**parsers)(command)
 
 
+def _bind_no_cache_flag(argv: list[str]) -> list[str]:
+    """
+    Pin a bare ``--no-cache`` to ``True`` wherever it appears on the command line.
+
+    Fire lets a bare ``--flag`` take the next word as its value, so in
+    ``eia-api --no-cache browse`` the subcommand name would be swallowed as the
+    value of ``--no-cache``. Rewriting ``--no-cache`` (or ``--no_cache``) to
+    ``--no_cache=True`` makes the flag work before or after the subcommand.
+    Arguments after a standalone ``--`` (Fire's own flags such as ``--help``)
+    are left untouched.
+
+    Args:
+        argv (list[str]): The command-line arguments, without the program name.
+
+    Returns:
+        list[str]: A new argument list with ``--no-cache`` bound explicitly.
+    """
+    out: list[str] = []
+    for i, arg in enumerate(argv):
+        if arg == "--":
+            return out + argv[i:]
+        out.append("--no_cache=True" if arg in {"--no-cache", "--no_cache"} else arg)
+    return out
+
+
 def main() -> None:
     """
     Run the Fire-generated command-line interface.
@@ -2803,7 +2888,7 @@ def main() -> None:
 
     _keep_codes_as_text()
     try:
-        fire.Fire(_Cli, name="eia-api")
+        fire.Fire(_Cli, name="eia-api", command=_bind_no_cache_flag(sys.argv[1:]))
     except (ValueError, RuntimeError, requests.RequestException) as exc:
         # Turn expected, user-facing errors (a missing key, an unknown route, an
         # HTTP failure) into a concise message rather than a full traceback.

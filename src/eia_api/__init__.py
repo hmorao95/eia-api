@@ -12,11 +12,13 @@ Exports:
         ``EIA.AsyncAPI``.
     Route: Immutable metadata (id, name, description) for one node of the API
         route tree.
+    DEFAULT_CACHE_DIR: Default ``cache_dir`` of the clients: cache in
+        ``~/.cache/eia_api``. Pass ``cache_dir=None`` to disable the disk cache.
     main: Entry point for the ``python-fire`` command-line interface.
 """
 
 from __future__ import annotations
 
-from eia_api.core import EIA, AsyncEIA, Route, main
+from eia_api.core import DEFAULT_CACHE_DIR, EIA, AsyncEIA, Route, main
 
-__all__ = ["EIA", "AsyncEIA", "Route", "main"]
+__all__ = ["DEFAULT_CACHE_DIR", "EIA", "AsyncEIA", "Route", "main"]

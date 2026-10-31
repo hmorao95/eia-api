@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- CLI flag `--no-cache`, accepted before or after any command, to skip the
+  on-disk response cache. By default the CLI still caches in
+  `~/.cache/eia_api`.
 - Opt-in tidy output: `get_data(..., tidy=True)` (sync and async, the `to_*`
   writers, `update_csv`/`new_observations`, and `--tidy` on the CLI's data
   commands) returns exactly `date`, the facet ids as dimensions (plus
@@ -29,6 +32,16 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   command. On a failed command the traceback goes to the log.
 - The API key is masked as `***` in log records from `urllib3` and `httpx`
   (which log full request URLs) and from the package logger.
+
+### Changed
+
+- **Behaviour change:** `cache_dir=None` now disables the on-disk cache (it
+  used to mean the default `~/.cache/eia_api` directory); omit the argument or
+  pass the new `DEFAULT_CACHE_DIR` for the default. `""` still disables the
+  cache, and calling `EIA()` / `AsyncEIA()` with no `cache_dir` caches in
+  `~/.cache/eia_api` as before. `DEFAULT_CACHE_DIR` is exported from the
+  package; the home directory is looked up when a client is built, not at
+  import.
 
 ### Fixed
 
