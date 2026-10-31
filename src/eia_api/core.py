@@ -128,7 +128,7 @@ class _RedactKeyFilter(logging.Filter):
     Remove registered API keys from log records.
 
     The key travels in the query string, and both HTTP clients log full URLs:
-    ``urllib3`` at DEBUG and ``httpx`` at INFO. This filter sits on those loggers
+    ``urllib3`` at DEBUG (requests and retries) and ``httpx`` at INFO. This filter sits on those loggers
     (and on the package logger, as a safety net) and rewrites any record that
     contains a key, replacing it with ``***``: any ``api_key=<value>`` query
     parameter is masked by pattern, and every registered key is masked wherever
@@ -164,7 +164,7 @@ class _RedactKeyFilter(logging.Filter):
 # One filter instance for the process; every key a client uses is registered on
 # it (see ``_register_secret``).
 _REDACT_FILTER = _RedactKeyFilter()
-for _name in ("urllib3.connectionpool", "httpx", "eia_api"):
+for _name in ("urllib3.connectionpool", "urllib3.util.retry", "httpx", "eia_api"):
     logging.getLogger(_name).addFilter(_REDACT_FILTER)
 
 
@@ -1798,6 +1798,33 @@ EIA.AsyncAPI = AsyncEIA
 # ---------------------------------------------------------------------- #
 # CLI
 # ---------------------------------------------------------------------- #
+class _PlainFormatter(logging.Formatter):
+    """
+    A file formatter that always renders tracebacks without color.
+
+    ``logging`` caches a record's formatted traceback in ``exc_text`` for the
+    next handler. The colored console formatter (on Python 3.13+) renders it
+    with ANSI color codes, which would then leak into the log file; this
+    formatter ignores the cache and formats the traceback itself.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        """
+        Format a record, re-rendering any traceback as plain text.
+
+        Args:
+            record (logging.LogRecord): The record to format.
+
+        Returns:
+            str: The formatted line(s).
+        """
+        cached, record.exc_text = record.exc_text, None
+        try:
+            return super().format(record)
+        finally:
+            record.exc_text = cached
+
+
 def _configure_logging(level: str = "WARNING", log_file: str | None = None) -> None:
     """
     Attach the CLI's console (and optional file) handlers to the package logger.
@@ -1854,7 +1881,7 @@ def _configure_logging(level: str = "WARNING", log_file: str | None = None) -> N
         file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(
-            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+            _PlainFormatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         )
         handlers.append(file_handler)
 

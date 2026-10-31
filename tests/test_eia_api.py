@@ -996,7 +996,9 @@ def test_cache_hit_is_logged(
     assert "Cache hit: electricity" in caplog.text
 
 
-@pytest.mark.parametrize("logger_name", ["urllib3.connectionpool", "httpx"])
+@pytest.mark.parametrize(
+    "logger_name", ["urllib3.connectionpool", "urllib3.util.retry", "httpx"]
+)
 def test_http_library_logs_are_redacted(
     logger_name: str, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1075,6 +1077,22 @@ def test_configure_logging_file_gets_debug(tmp_path: Path) -> None:
     logging.getLogger("eia_api").debug("detail for the file")
     text = log_file.read_text(encoding="utf-8")
     assert "eia_api - DEBUG - detail for the file" in text
+
+
+def test_log_file_traceback_has_no_color_codes(tmp_path: Path) -> None:
+    """A traceback colored for the console is written plain to the log file."""
+    log_file = tmp_path / "run.log"
+    eia_core._configure_logging("DEBUG", str(log_file))
+    for handler in logging.getLogger("eia_api").handlers:
+        formatter = getattr(handler, "formatter", None)
+        if formatter is not None and hasattr(formatter, "force_color"):
+            formatter.force_color = True  # color the console even off a tty
+    with pytest.raises(ValueError, match="log_level") as info:
+        eia_core._configure_logging("loud")  # fails before touching handlers
+    logging.getLogger("eia_api").debug("failed", exc_info=info.value)
+    text = log_file.read_text(encoding="utf-8")
+    assert "ValueError: log_level must be one of" in text
+    assert "\x1b[" not in text
 
 
 @pytest.mark.parametrize(
