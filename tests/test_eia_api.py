@@ -25,7 +25,7 @@ import eia_api.core as eia_core
 from eia_api.core import EIA, Route
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 # --------------------------------------------------------------------------- #
 # Fixtures / helpers
@@ -170,6 +170,9 @@ class _FakeResponse:
         """No-op; canned responses are always considered successful."""
 
 
+_ROUTE = "electricity/retail-sales"
+
+
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> EIA:
     """Return a client whose HTTP layer is replaced by the synthetic API."""
@@ -241,9 +244,11 @@ def test_data_params_encodes_brackets() -> None:
     assert ("length", "5000") in params
 
 
-def test_params_without_key_raises() -> None:
+def test_params_without_key_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     """A missing API key raises a helpful error before any request."""
-    eia = EIA(api_key="", cache_dir=None)
+    # An empty key falls back to EIA_API_KEY, so unset it for this test.
+    monkeypatch.delenv("EIA_API_KEY", raising=False)
+    eia = EIA(api_key="", cache_dir="")
     with pytest.raises(ValueError, match="No EIA API key"):
         eia._params()
 
@@ -251,7 +256,7 @@ def test_params_without_key_raises() -> None:
 def test_api_key_read_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     """The client falls back to the EIA_API_KEY environment variable."""
     monkeypatch.setenv("EIA_API_KEY", "from-env")
-    assert EIA(cache_dir=None).api_key == "from-env"
+    assert EIA(cache_dir="").api_key == "from-env"
 
 
 # --------------------------------------------------------------------------- #
@@ -914,6 +919,89 @@ def test_cli_update_csv(cli: eia_core._Cli, tmp_path: Path) -> None:
     )
     assert out.exists()
     assert "3 new/revised rows" in msg
+
+
+class _RecordingEIA:
+    """Stand-in client that records the keyword arguments each method gets."""
+
+    def __init__(self) -> None:
+        """Start with no recorded calls."""
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def __getattr__(self, name: str) -> Callable[..., pd.DataFrame]:
+        """Return a recorder for any client method (``get_data``, ``to_csv``...)."""
+
+        def _method(*_args: Any, **kwargs: Any) -> pd.DataFrame:
+            self.calls.append((name, kwargs))
+            return pd.DataFrame()
+
+        return _method
+
+
+@pytest.mark.parametrize(
+    ("command", "method"),
+    [
+        (["get_data", _ROUTE], "get_data"),
+        (["get_data", _ROUTE, "--out", "o.csv"], "to_csv"),
+        (["get_data", _ROUTE, "--out", "o.xlsx"], "to_excel"),
+        (["to_csv", "o.csv", _ROUTE], "to_csv"),
+        (["to_excel", "o.xlsx", _ROUTE], "to_excel"),
+        (["to_parquet", "o.parquet", _ROUTE], "to_parquet"),
+        (["to_json", "o.json", _ROUTE], "to_json"),
+        (["update_csv", "o.csv", _ROUTE], "update_csv"),
+    ],
+)
+def test_cli_bare_number_bounds_reach_the_client_as_text(
+    cli: eia_core._Cli,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: list[str],
+    method: str,
+) -> None:
+    """Fire turns ``--start 2024`` into an int; the client still gets ``"2024"``."""
+    monkeypatch.chdir(tmp_path)
+    recorder = _RecordingEIA()
+    monkeypatch.setattr(cli, "_eia", recorder)
+    fire.Fire(cli, command=[*command, "--start", "2024", "--end", "202406"])
+    [(name, kwargs)] = recorder.calls
+    assert name == method
+    assert kwargs["start"] == "2024"
+    assert kwargs["end"] == "202406"
+
+
+def test_cli_omitted_bounds_stay_none(
+    cli: eia_core._Cli, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bounds left off the command line reach the client as ``None``."""
+    recorder = _RecordingEIA()
+    monkeypatch.setattr(cli, "_eia", recorder)
+    fire.Fire(cli, command=["get_data", _ROUTE])
+    [(_, kwargs)] = recorder.calls
+    assert kwargs["start"] is None
+    assert kwargs["end"] is None
+
+
+def test_cli_bare_number_bounds_share_the_library_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A CLI call with ``--start 2024`` is served from the library call's cache."""
+    eia = EIA(api_key="k", cache_dir=tmp_path)
+    calls = {"n": 0}
+
+    def _fake_get(_url: str, params: list[tuple[str, str]], **_k: Any) -> _FakeResponse:
+        calls["n"] += 1
+        endpoint = _url.removeprefix(eia_core._BASE_URL).strip("/")
+        return _FakeResponse({"response": _fake_request(endpoint, params)})
+
+    monkeypatch.setattr(eia.session, "get", _fake_get)
+    eia.get_data(_ROUTE, data="price", start="2024")
+    after_library = calls["n"]
+    facade = eia_core._Cli.__new__(eia_core._Cli)
+    facade._eia = eia
+    fire.Fire(
+        facade, command=["get_data", _ROUTE, "--data", "price", "--start", "2024"]
+    )
+    assert calls["n"] == after_library
 
 
 def test_cli_out_defaults_to_outputs_folder(

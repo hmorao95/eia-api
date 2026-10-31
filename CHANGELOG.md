@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- CLI period bounds given as bare numbers (`--start 2024`, `--end 202406`) are
+  passed to the client as text. python-fire had turned them into ints, which
+  broke the `str | None` contract and gave the query a different cache entry
+  from the equivalent library call; the query builder now also stringifies the
+  bounds.
 - `--log-file` no longer gets ANSI color codes in tracebacks on Python 3.13+:
   the file handler re-renders tracebacks instead of reusing the console's
   colored copy.

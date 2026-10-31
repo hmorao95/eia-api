@@ -375,9 +375,9 @@ def _encode_data_params(
         items = [values] if isinstance(values, str) else list(values)
         params.extend((f"facets[{facet_id}][]", str(v)) for v in items)
     if start:
-        params.append(("start", start))
+        params.append(("start", str(start)))
     if end:
-        params.append(("end", end))
+        params.append(("end", str(end)))
     for i, (column, direction) in enumerate(sort):
         params.extend(
             [(f"sort[{i}][column]", column), (f"sort[{i}][direction]", direction)]
@@ -1892,6 +1892,26 @@ def _configure_logging(level: str = "WARNING", log_file: str | None = None) -> N
     _log.setLevel(logging.DEBUG if log_file else console_level)
 
 
+def _as_text(value: object) -> str | None:
+    """
+    Pass a CLI period bound through as text.
+
+    python-fire parses arguments that look like numbers, so ``--start 2024``
+    arrives as the int ``2024`` and ``--end 202406`` as ``202406``. Turning them
+    back into strings keeps the client's ``str | None`` contract and gives the
+    same query, and the same cache entry, as the library call
+    ``start="2024"``.
+
+    Args:
+        value (object): The value Fire passed, or ``None`` when the flag was
+            not given.
+
+    Returns:
+        str | None: ``None`` unchanged, anything else as ``str(value)``.
+    """
+    return None if value is None else str(value)
+
+
 class _Cli:
     """
     Command-line facade over :class:`EIA`.
@@ -2046,8 +2066,8 @@ class _Cli:
                 data=data,
                 facets=facets,
                 frequency=frequency,
-                start=start,
-                end=end,
+                start=_as_text(start),
+                end=_as_text(end),
                 offset=offset,
                 length=length,
                 max_rows=max_rows,
@@ -2070,8 +2090,8 @@ class _Cli:
             data=data,
             facets=facets,
             frequency=frequency,
-            start=start,
-            end=end,
+            start=_as_text(start),
+            end=_as_text(end),
             offset=offset,
             length=length,
             max_rows=max_rows,
@@ -2112,8 +2132,8 @@ class _Cli:
             data=data,
             facets=facets,
             frequency=frequency,
-            start=start,
-            end=end,
+            start=_as_text(start),
+            end=_as_text(end),
             max_rows=max_rows,
         )
         return f"Wrote {path}"
@@ -2152,8 +2172,8 @@ class _Cli:
             data=data,
             facets=facets,
             frequency=frequency,
-            start=start,
-            end=end,
+            start=_as_text(start),
+            end=_as_text(end),
             max_rows=max_rows,
         )
         return f"Wrote {path}"
@@ -2192,8 +2212,8 @@ class _Cli:
             data=data,
             facets=facets,
             frequency=frequency,
-            start=start,
-            end=end,
+            start=_as_text(start),
+            end=_as_text(end),
             max_rows=max_rows,
         )
         return f"Wrote {path}"
@@ -2232,8 +2252,8 @@ class _Cli:
             data=data,
             facets=facets,
             frequency=frequency,
-            start=start,
-            end=end,
+            start=_as_text(start),
+            end=_as_text(end),
             max_rows=max_rows,
         )
         return f"Wrote {path}"
@@ -2270,8 +2290,8 @@ class _Cli:
             data=data,
             facets=facets,
             frequency=frequency,
-            start=start,
-            end=end,
+            start=_as_text(start),
+            end=_as_text(end),
         )
         return f"Wrote {len(changed):,} new/revised rows -> {path}"
 
