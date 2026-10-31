@@ -60,7 +60,9 @@ from __future__ import (  # Enables modern (PEP 604 / postponed) annotations.
 import asyncio  # Backs the async client's non-blocking throttle sleep.
 import hashlib  # Derives the on-disk cache filename from the request signature.
 import json  # Serialises the cache key and reads/writes cached JSON payloads.
+import logging  # Reports requests, cache hits and progress; redacts the key.
 import os  # Reads the EIA_API_KEY environment variable as a key fallback.
+import re  # Masks the api_key query parameter in logged URLs.
 import sys  # Writes clean CLI error messages to stderr.
 import time  # Compares a cached file's mtime against the freshness TTL.
 from dataclasses import dataclass  # Builds the immutable Route value type.
@@ -98,6 +100,98 @@ _ENV_KEY = "EIA_API_KEY"
 _USER_AGENT = (
     "Mozilla/5.0 (compatible; eia-api-wrapper/1.0; +https://www.eia.gov/opendata/)"
 )
+
+# The package logger. As a library it only emits records; the NullHandler keeps
+# them silent until an application (or the CLI, see ``_configure_logging``)
+# attaches a handler, e.g. ``logging.getLogger("eia_api").setLevel("DEBUG")``.
+_log = logging.getLogger("eia_api")
+_log.addHandler(logging.NullHandler())
+
+# Levels accepted by the CLI's ``--log-level`` flag.
+_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+
+# Marks the handlers the CLI installs, so reconfiguring replaces them instead of
+# stacking duplicates.
+_CLI_HANDLER_FLAG = "_eia_api_cli_handler"
+
+# Matches the key's query parameter in a logged URL; group 1 keeps the name.
+_KEY_PARAM = re.compile(r"(api_key=)[^&\s\"']+")
+
+# Keys shorter than this are not registered for plain-text masking: replacing a
+# tiny string everywhere would mangle unrelated text. Real EIA keys are 40
+# characters, and the pattern above still masks short keys inside URLs.
+_MIN_SECRET_LENGTH = 8
+
+
+class _RedactKeyFilter(logging.Filter):
+    """
+    Remove registered API keys from log records.
+
+    The key travels in the query string, and both HTTP clients log full URLs:
+    ``urllib3`` at DEBUG and ``httpx`` at INFO. This filter sits on those loggers
+    (and on the package logger, as a safety net) and rewrites any record that
+    contains a key, replacing it with ``***``: any ``api_key=<value>`` query
+    parameter is masked by pattern, and every registered key is masked wherever
+    it appears. Records are never dropped, so applications keep their HTTP
+    logs, minus the secret.
+    """
+
+    def __init__(self) -> None:
+        """Start with no registered keys."""
+        super().__init__()
+        self.secrets: set[str] = set()
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """
+        Redact registered keys from a record's message.
+
+        Args:
+            record (logging.LogRecord): The record about to be emitted.
+
+        Returns:
+            bool: Always ``True``: the record is kept, only its text changes.
+        """
+        message = record.getMessage()
+        cleaned = _KEY_PARAM.sub(r"\1***", message)
+        for secret in self.secrets:
+            cleaned = cleaned.replace(secret, "***")
+        if cleaned != message:
+            # Freeze the cleaned text so later formatting cannot re-insert it.
+            record.msg, record.args = cleaned, ()
+        return True
+
+
+# One filter instance for the process; every key a client uses is registered on
+# it (see ``_register_secret``).
+_REDACT_FILTER = _RedactKeyFilter()
+for _name in ("urllib3.connectionpool", "httpx", "eia_api"):
+    logging.getLogger(_name).addFilter(_REDACT_FILTER)
+
+
+def _register_secret(api_key: str | None) -> None:
+    """
+    Register an API key with the redaction filter.
+
+    Args:
+        api_key (str | None): The key to scrub from logs; ``None`` or a key
+            shorter than ``_MIN_SECRET_LENGTH`` is ignored.
+    """
+    if api_key and len(api_key) >= _MIN_SECRET_LENGTH:
+        _REDACT_FILTER.secrets.add(api_key)
+
+
+def _loggable(params: Sequence[tuple[str, str]]) -> str:
+    """
+    Render request parameters for a log line, without the API key.
+
+    Args:
+        params (Sequence[tuple[str, str]]): Request parameters as (name, value)
+            pairs, possibly including ``api_key``.
+
+    Returns:
+        str: ``name=value`` pairs joined by ``&``, with ``api_key`` left out.
+    """
+    return "&".join(f"{k}={v}" for k, v in params if k != "api_key")
 
 
 def _cache_path(
@@ -432,6 +526,7 @@ class EIA:
         # Fall back to the environment when no key is passed; validation is
         # deferred to the first network call so metadata-free use never trips.
         self.api_key = api_key or os.environ.get(_ENV_KEY)
+        _register_secret(self.api_key)
 
         # A literal ``None`` means "use the default per-user cache directory";
         # any other falsy value (e.g. "") disables caching below.
@@ -525,6 +620,7 @@ class EIA:
             time.monotonic() - self._last_request_monotonic
         )
         if wait > 0:
+            _log.debug("Throttling: sleeping %.3fs", wait)
             time.sleep(wait)
         self._last_request_monotonic = time.monotonic()
 
@@ -557,14 +653,24 @@ class EIA:
         if cache_file and cache_file.exists():
             age = time.time() - cache_file.stat().st_mtime
             if age < self.cache_ttl_seconds:
+                _log.debug("Cache hit: %s (age %.0fs)", endpoint, age)
                 cached = json.loads(cache_file.read_text("utf-8"))
                 cached_response: dict[str, Any] = cached["response"]
                 return cached_response
+            _log.debug("Cache expired: %s (age %.0fs)", endpoint, age)
 
         # Only real network requests are throttled; cache hits returned above.
         self._throttle()
+        _log.debug("GET %s %s", endpoint, _loggable(params))
+        started = time.monotonic()
         resp = self.session.get(
             _BASE_URL + endpoint, params=list(params), timeout=self.timeout
+        )
+        _log.debug(
+            "HTTP %s for %s in %.2fs",
+            resp.status_code,
+            endpoint,
+            time.monotonic() - started,
         )
         payload = resp.json()
         # EIA signals a bad key, unknown route, etc. with a top-level "error"
@@ -877,6 +983,7 @@ class EIA:
             list[dict[str, Any]]: The accumulated raw row dictionaries.
         """
         rows: list[dict[str, Any]] = []
+        pages = 0
         while True:
             extra = self._data_params(
                 columns=columns,
@@ -891,18 +998,30 @@ class EIA:
             resp = self._request(f"{route}/data", self._params(extra))
             batch = resp.get("data", []) or []
             rows.extend(batch)
+            pages += 1
+            total = resp.get("total")
+            _log.debug(
+                "%s: page %d, %d rows (%d of %s so far)",
+                route,
+                pages,
+                len(batch),
+                len(rows),
+                total if total is not None else "?",
+            )
 
             # Stop once we have enough for the caller's cap.
             if max_rows is not None and len(rows) >= max_rows:
-                return rows[:max_rows]
+                rows = rows[:max_rows]
+                break
             # A short page means the server had nothing more to give.
             if len(batch) < page:
-                return rows
+                break
             # Otherwise advance; also stop if we have reached the reported total.
             offset += page
-            total = resp.get("total")
             if total is not None and offset >= int(total):
-                return rows
+                break
+        _log.info("Fetched %d rows from %s in %d page(s)", len(rows), route, pages)
+        return rows
 
     @staticmethod
     def _data_params(
@@ -986,6 +1105,7 @@ class EIA:
         frame = self.get_data(**kwargs)
         path = Path(path)
         frame.to_csv(path, index=False)
+        _log.info("Wrote %d rows to %s", len(frame), path)
         return path
 
     def to_excel(self, path: str | Path, **kwargs: Any) -> Path:
@@ -1010,6 +1130,7 @@ class EIA:
         if "date" in frame.columns:
             frame["date"] = pd.to_datetime(frame["date"]).dt.date
         frame.to_excel(path, index=False, sheet_name="data")
+        _log.info("Wrote %d rows to %s", len(frame), path)
         return path
 
     def to_parquet(self, path: str | Path, **kwargs: Any) -> Path:
@@ -1029,6 +1150,7 @@ class EIA:
         frame = self.get_data(**kwargs)
         path = Path(path)
         frame.to_parquet(path, index=False)
+        _log.info("Wrote %d rows to %s", len(frame), path)
         return path
 
     def to_json(self, path: str | Path, **kwargs: Any) -> Path:
@@ -1047,6 +1169,7 @@ class EIA:
         frame = self.get_data(**kwargs)
         path = Path(path)
         frame.to_json(path, orient="records", date_format="iso", indent=2)
+        _log.info("Wrote %d rows to %s", len(frame), path)
         return path
 
     # ------------------------------------------------------------------ #
@@ -1173,13 +1296,17 @@ class EIA:
         fresh = self.get_data(route, data=value_cols, **kwargs)
         existing_frame = self._coerce_frame(existing, fresh)
         key_cols = self._key_columns(fresh, value_cols)
-        return self._select_new(
+        new = self._select_new(
             fresh,
             existing_frame,
             key_cols,
             value_cols,
             include_revisions=include_revisions,
         )
+        _log.info(
+            "%s: %d new/revised rows versus the existing extract", route, len(new)
+        )
+        return new
 
     @staticmethod
     def _coerce_frame(
@@ -1249,13 +1376,16 @@ class EIA:
         # it (every row is "new").
         if not path.exists():
             fresh.to_csv(path, index=False)
+            _log.info("Created %s with %d rows", path, len(fresh))
             return fresh
 
         existing = self._coerce_frame(path, fresh)
         key_cols = self._key_columns(fresh, value_cols)
         changed = self._select_new(fresh, existing, key_cols, value_cols)
         if changed.empty:
-            return changed  # already up to date; leave the file untouched
+            # Already up to date; leave the file untouched.
+            _log.info("%s is already up to date", path)
+            return changed
 
         # Upsert: concatenate old and fresh, then keep the fresh row wherever a
         # key collides (``keep="last"``) so revised values overwrite stale ones
@@ -1267,6 +1397,12 @@ class EIA:
             .reset_index(drop=True)
         )
         combined.to_csv(path, index=False)
+        _log.info(
+            "Upserted %d new/revised rows into %s (%d rows total)",
+            len(changed),
+            path,
+            len(combined),
+        )
         return changed
 
 
@@ -1329,6 +1465,7 @@ class AsyncEIA:
             client (httpx.AsyncClient | None): Optional pre-built async client.
         """
         self.api_key = api_key or os.environ.get(_ENV_KEY)
+        _register_secret(self.api_key)
         if cache_dir is None:
             cache_dir = Path.home() / ".cache" / "eia_api"
         self.cache_dir = Path(cache_dir) if cache_dir else None
@@ -1400,6 +1537,7 @@ class AsyncEIA:
             time.monotonic() - self._last_request_monotonic
         )
         if wait > 0:
+            _log.debug("Throttling: sleeping %.3fs", wait)
             await asyncio.sleep(wait)
         self._last_request_monotonic = time.monotonic()
 
@@ -1430,17 +1568,27 @@ class AsyncEIA:
         if cache_file and cache_file.exists():
             age = time.time() - cache_file.stat().st_mtime
             if age < self.cache_ttl_seconds:
+                _log.debug("Cache hit: %s (age %.0fs)", endpoint, age)
                 cached = json.loads(cache_file.read_text("utf-8"))
                 cached_response: dict[str, Any] = cached["response"]
                 return cached_response
+            _log.debug("Cache expired: %s (age %.0fs)", endpoint, age)
 
         # Only real network requests are throttled; cache hits returned above.
         await self._throttle()
         if self._client is None:
             self._client = httpx.AsyncClient(headers={"User-Agent": _USER_AGENT})
             self._owns_client = True
+        _log.debug("GET %s %s", endpoint, _loggable(params))
+        started = time.monotonic()
         resp = await self._client.get(
             _BASE_URL + endpoint, params=list(params), timeout=self.timeout
+        )
+        _log.debug(
+            "HTTP %s for %s in %.2fs",
+            resp.status_code,
+            endpoint,
+            time.monotonic() - started,
         )
         payload = resp.json()
         if isinstance(payload, dict) and payload.get("error"):
@@ -1605,6 +1753,7 @@ class AsyncEIA:
         page = min(length, _MAX_LENGTH)
 
         rows: list[dict[str, Any]] = []
+        pages = 0
         while True:
             extra = _encode_data_params(
                 columns=columns,
@@ -1619,15 +1768,25 @@ class AsyncEIA:
             resp = await self._request(f"{route}/data", self._params(extra))
             batch = resp.get("data", []) or []
             rows.extend(batch)
+            pages += 1
+            total = resp.get("total")
+            _log.debug(
+                "%s: page %d, %d rows (%d of %s so far)",
+                route,
+                pages,
+                len(batch),
+                len(rows),
+                total if total is not None else "?",
+            )
             if max_rows is not None and len(rows) >= max_rows:
                 rows = rows[:max_rows]
                 break
             if len(batch) < page:
                 break
             offset += page
-            total = resp.get("total")
             if total is not None and offset >= int(total):
                 break
+        _log.info("Fetched %d rows from %s in %d page(s)", len(rows), route, pages)
         return _rows_to_frame(rows, columns)
 
 
@@ -1639,6 +1798,73 @@ EIA.AsyncAPI = AsyncEIA
 # ---------------------------------------------------------------------- #
 # CLI
 # ---------------------------------------------------------------------- #
+def _configure_logging(level: str = "WARNING", log_file: str | None = None) -> None:
+    """
+    Attach the CLI's console (and optional file) handlers to the package logger.
+
+    Only the command line calls this; the library itself never configures
+    logging. The console handler writes colored records to stderr, so stdout
+    keeps only the command's output and can still be piped. The file handler,
+    when requested, appends every record down to DEBUG with full timestamps,
+    whatever the console level. Calling it again replaces the handlers it added
+    earlier rather than stacking duplicates.
+
+    Args:
+        level (str): Console threshold, one of ``DEBUG``, ``INFO``, ``WARNING``
+            or ``ERROR`` (case-insensitive).
+        log_file (str | None): Path of a log file to append to, or ``None`` for
+            console logging only.
+
+    Raises:
+        ValueError: If ``level`` is not one of the accepted names.
+    """
+    # Imported lazily, like fire: only the CLI needs colored output.
+    import colorlog
+
+    name = level.upper()
+    if name not in _LOG_LEVELS:
+        msg = f"log_level must be one of {', '.join(_LOG_LEVELS)}, got {level!r}."
+        raise ValueError(msg)
+    console_level = getattr(logging, name)
+
+    # Drop the handlers a previous call installed, keep anything else.
+    for handler in list(_log.handlers):
+        if getattr(handler, _CLI_HANDLER_FLAG, False):
+            _log.removeHandler(handler)
+            handler.close()
+
+    console = colorlog.StreamHandler(sys.stderr)
+    console.setLevel(console_level)
+    console.setFormatter(
+        colorlog.ColoredFormatter(
+            "%(log_color)s%(asctime)s - %(levelname)s%(reset)s %(message)s",
+            datefmt="%H:%M:%S",
+            log_colors={
+                "DEBUG": "cyan",
+                "INFO": "green",
+                "WARNING": "yellow",
+                "ERROR": "red",
+                "CRITICAL": "red,bg_white",
+            },
+        )
+    )
+    handlers: list[logging.Handler] = [console]
+
+    if log_file:
+        file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        )
+        handlers.append(file_handler)
+
+    for handler in handlers:
+        setattr(handler, _CLI_HANDLER_FLAG, True)
+        _log.addHandler(handler)
+    # The logger must pass the most verbose level any handler wants.
+    _log.setLevel(logging.DEBUG if log_file else console_level)
+
+
 class _Cli:
     """
     Command-line facade over :class:`EIA`.
@@ -1649,14 +1875,25 @@ class _Cli:
     return display-ready text (a formatted table or a status line) rather than
     raw DataFrames, because Fire would otherwise introspect a returned DataFrame
     and print its attributes instead of the data.
+
+    The constructor's parameters become global flags, accepted with any
+    command: ``--log-level`` and ``--log-file``.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, log_level: str = "WARNING", log_file: str | None = None) -> None:
         """
-        Initialise the facade with a default :class:`EIA` client.
+        Set up CLI logging and a default :class:`EIA` client.
 
         Tests replace the ``_eia`` attribute with a network-mocked client.
+
+        Args:
+            log_level (str): Console log threshold: ``DEBUG``, ``INFO``,
+                ``WARNING`` (default, quiet) or ``ERROR``. Log lines go to
+                stderr, so command output on stdout stays clean.
+            log_file (str | None): Append a full DEBUG log with timestamps to
+                this file. A bare filename is written into ``outputs/``.
         """
+        _configure_logging(log_level, self._resolve_out(log_file) if log_file else None)
         self._eia = EIA()
 
     def browse(self, route: str = "") -> str:
@@ -2039,6 +2276,9 @@ def main() -> None:
     except (ValueError, RuntimeError, requests.RequestException) as exc:
         # Turn expected, user-facing errors (a missing key, an unknown route, an
         # HTTP failure) into a concise message rather than a full traceback.
+        # The traceback still goes to the log (shown with --log-level DEBUG and
+        # always written to --log-file).
+        _log.debug("Command failed", exc_info=True)
         print(f"Error: {exc}", file=sys.stderr)  # ruff: ignore[print]
         raise SystemExit(1) from exc
 
