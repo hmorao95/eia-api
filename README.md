@@ -164,7 +164,59 @@ What the arguments mean:
 
 The tidy frame has a parsed `date` column first, then the API's `period`, the
 facet columns, and each requested value column with its `<column>-units`
-companion.
+companion. That default never changes; `tidy=True` and `as_polars=True` (below)
+are opt-in.
+
+### Tidy output
+
+Pass `tidy=True` to `get_data` (or any writer, `update_csv` or the CLI's
+`--tidy`) for a standard long shape with exactly these columns:
+
+| Column | Type | Content |
+|---|---|---|
+| `date` | `datetime64[ns]` | Period start (year → 1 Jan, quarter → first month, ...) |
+| facet ids, e.g. `stateid`, `sectorid` | string | One column per facet, snake_case, codes |
+| `<facet>_name`, e.g. `stateid_name` | string | The facet's label, where the API sends one |
+| `variable` | string | The measure id (`price`, `sales`, ...) |
+| `value` | float64 | The number; non-numeric cells become NaN, rows kept |
+| `unit` | string | From the `<measure>-units` column; `<NA>` when absent |
+
+Each requested measure becomes its own block of rows, so
+`data=["price", "sales"]` gives two rows per observation. Rows are sorted by the
+dimensions, then `date`; the raw `period` is dropped.
+
+```python
+eia.get_data("electricity/retail-sales", data=["price", "sales"], tidy=True)
+# columns: date, stateid, stateid_name, sectorid, sectorid_name,
+#          variable, value, unit
+```
+
+### Polars
+
+Pass `as_polars=True` (works with `tidy=True` too) to get a
+[polars](https://pola.rs/) DataFrame. polars is an optional extra:
+
+```bash
+pip install "eia-api[polars]"
+```
+
+```python
+eia.get_data("electricity/retail-sales", data="price", tidy=True, as_polars=True)
+```
+
+Type checkers see `pd.DataFrame` by default and `pl.DataFrame` when
+`as_polars=True`.
+
+### Parquet
+
+`to_parquet()` (CLI: `to-parquet`, or `get-data --out file.parquet`) fetches
+and writes a Parquet file in one step, in either shape:
+
+```python
+eia.to_parquet(
+    "retail.parquet", route="electricity/retail-sales", data="price", tidy=True
+)
+```
 
 ### Async
 
@@ -189,6 +241,9 @@ async def main():
 
 gas, power = asyncio.run(main())
 ```
+
+`AsyncEIA.get_data` takes the same `tidy` and `as_polars` flags and returns the
+same frames as the sync client.
 
 ## Command line
 
@@ -258,12 +313,12 @@ this from the CLI.
 | `facets` | `ROUTE` | (none) |
 | `data-columns` | `ROUTE` | (none) |
 | `facet-values` | `ROUTE FACET_ID` | (none) |
-| `get-data` | `ROUTE` | `--data --facets --frequency --start --end --offset --length --max-rows --out` |
-| `to-csv` | `PATH` | `--route --data --facets --frequency --start --end --max-rows` |
-| `to-excel` | `PATH` | `--route --data --facets --frequency --start --end --max-rows` |
-| `to-parquet` | `PATH` | `--route --data --facets --frequency --start --end --max-rows` |
-| `to-json` | `PATH` | `--route --data --facets --frequency --start --end --max-rows` |
-| `update-csv` | `PATH` | `--route --data --facets --frequency --start --end` |
+| `get-data` | `ROUTE` | `--data --facets --frequency --start --end --offset --length --max-rows --out --tidy` |
+| `to-csv` | `PATH` | `--route --data --facets --frequency --start --end --max-rows --tidy` |
+| `to-excel` | `PATH` | `--route --data --facets --frequency --start --end --max-rows --tidy` |
+| `to-parquet` | `PATH` | `--route --data --facets --frequency --start --end --max-rows --tidy` |
+| `to-json` | `PATH` | `--route --data --facets --frequency --start --end --max-rows --tidy` |
+| `update-csv` | `PATH` | `--route --data --facets --frequency --start --end --tidy` |
 
 For `get-data`, `--out` picks the format by extension (`.xlsx`/`.xls` Excel,
 `.parquet` Parquet, `.json` JSON, otherwise CSV); without `--out` it prints a
@@ -281,6 +336,7 @@ folder; pass a path with a directory to write elsewhere.
 | `--start`, `--end` | e.g. `2015`, `2015-01`, `2015-01-01` | Inclusive period bounds. |
 | `--length` | int (≤ 5000) | Page size per request. Pagination is automatic. |
 | `--max-rows` | int | Stop after this many rows. |
+| `--tidy` | flag | Use the [tidy shape](#tidy-output) (`date`, dimensions, `variable`, `value`, `unit`). |
 | `--log-level` | `debug`, `info`, `warning`, `error` | Console log threshold (default `warning`); log lines go to stderr. Works with any command. |
 | `--log-file` | path | Append a full DEBUG log with timestamps. Works with any command. |
 
@@ -312,7 +368,7 @@ throttled) so bulk pagination stays polite to the API; pass `None` to disable.
 | `facets(route)` | DataFrame of filtering dimensions |
 | `data_columns(route)` | DataFrame of value columns `[id, alias, units]` |
 | `facet_values(route, facet_id)` | DataFrame of a facet's allowed values |
-| `get_data(route, data=None, facets=None, frequency=None, start=None, end=None, sort=None, offset=0, length=5000, max_rows=None)` | Tidy long DataFrame |
+| `get_data(route, data=None, facets=None, frequency=None, start=None, end=None, sort=None, offset=0, length=5000, max_rows=None, *, tidy=False, as_polars=False)` | Long DataFrame (tidy shape with `tidy=True`, polars with `as_polars=True`) |
 | `to_csv(path, **kwargs)` | Writes CSV; returns the `Path` |
 | `to_excel(path, **kwargs)` | Writes `.xlsx`; returns the `Path` |
 | `to_parquet(path, **kwargs)` | Writes `.parquet`; returns the `Path` |
@@ -320,9 +376,10 @@ throttled) so bulk pagination stays polite to the API; pass `None` to disable.
 | `update_csv(path, route, data=None, **kwargs)` | Upserts the CSV; returns the added/revised rows |
 | `new_observations(existing, route, data=None, include_revisions=True, **kwargs)` | Rows missing from `existing` (DataFrame or CSV path) |
 
-The `to_*` writers forward `**kwargs` to `get_data`. The tidy output columns are
-`date`, `period`, the facet columns, and each requested value column plus its
-`<column>-units` companion.
+The `to_*` writers and `update_csv` forward `**kwargs` (including `tidy=True`)
+to `get_data`. The default output columns are `date`, `period`, the facet
+columns, and each requested value column plus its `<column>-units` companion;
+see [Tidy output](#tidy-output) for the `tidy=True` shape.
 
 ## Incremental updates
 
@@ -334,6 +391,10 @@ rewriting the whole file each run:
   plus the facet columns): they append new observations and overwrite any values
   EIA has since revised.
 - If nothing changed, the file is left untouched and an empty frame is returned.
+- With `tidy=True` the file is kept in the [tidy shape](#tidy-output) and the
+  key is the dimensions, `variable` and `date`. Use the same setting every run.
+- Keys are compared as text, so facet ids such as `"01"` survive the CSV
+  round-trip.
 
 ```python
 new_rows = eia.update_csv(

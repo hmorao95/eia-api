@@ -33,16 +33,47 @@ The tidy frame has a parsed `date` column first, then the API's `period`, the
 facet columns, and each requested value column with its `<column>-units`
 companion. Pagination past the 5000-row cap is automatic.
 
+## Tidy output and polars
+
+Both are opt-in; the default frame above never changes.
+
+`tidy=True` (on `get_data`, the writers, `update_csv`, and `--tidy` on the CLI)
+returns exactly these columns: `date` (period start, `datetime64[ns]`), the facet
+ids as string dimension columns (snake_case codes, plus `<facet>_name` for a
+facet's label where the API sends one), `variable` (the measure id), `value`
+(float64; non-numeric cells become NaN) and `unit` (from the `<measure>-units`
+column, `<NA>` when absent). Each requested measure becomes its own block of
+rows, sorted by the dimensions, then `date`.
+
+```python
+eia.get_data("electricity/retail-sales", data=["price", "sales"], tidy=True)
+```
+
+`as_polars=True` returns a [polars](https://pola.rs/) DataFrame instead (with or
+without `tidy`). Install the optional extra first: `pip install "eia-api[polars]"`.
+
 ## Export and incremental updates
 
 ```python
 eia.to_csv("retail_price.csv", route="electricity/retail-sales", data="price")
 eia.to_excel("retail_price.xlsx", route="electricity/retail-sales", data="price")
 
+eia.to_parquet("retail_price.parquet", route="electricity/retail-sales", data="price")
+
 # Append only newer periods (and overwrite revised values):
 eia.update_csv("retail_price.csv", route="electricity/retail-sales", data="price",
                frequency="monthly")
+
+# The same, keeping the file in the tidy shape (use the same setting every run):
+eia.update_csv("retail_tidy.csv", route="electricity/retail-sales", data="price",
+               tidy=True)
 ```
+
+`update_csv` upserts on the row key (`period` plus the facet columns; in the
+tidy shape the dimensions, `variable` and `date`), compares keys as text so they
+survive the CSV round-trip, keeps stored history the fresh pull no longer
+covers, and leaves the file untouched when nothing changed.
+`new_observations(existing, ...)` returns the same delta in memory.
 
 ## Rate limiting
 

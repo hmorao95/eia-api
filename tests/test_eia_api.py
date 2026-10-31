@@ -182,8 +182,11 @@ def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> EIA:
 
 
 @pytest.fixture
-def cli(client: EIA) -> eia_core._Cli:
+def cli(client: EIA, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> eia_core._Cli:
     """The Fire CLI facade, bound to the mocked client."""
+    # The facade builds a default client first, whose cache dir lives under
+    # the home directory; point that at tmp_path so tests never touch it.
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     facade = eia_core._Cli()
     facade._eia = client  # swap the real client for the offline mock
     return facade
@@ -1364,3 +1367,352 @@ def test_pyproject_and_citation_versions_agree() -> None:
     pyproject = _file_version(root / "pyproject.toml", r'^version = "([^"]+)"')
     citation = _file_version(root / "CITATION.cff", r'^version:\s*"?([^"\s]+)"?')
     assert pyproject == citation
+
+
+# --------------------------------------------------------------------------- #
+# Tidy output, polars, incremental updates in the tidy shape
+# --------------------------------------------------------------------------- #
+
+_MULTI = "electricity/state-profiles"
+
+# Two measures per row, facet label columns after each id, a measure with no
+# "-units" companion ("customers") and a non-numeric cell ("(s)"). Rows are
+# deliberately out of order so the tidy sort is exercised.
+_MULTI_ROWS: list[dict[str, Any]] = [
+    {
+        "period": "2021",
+        "stateid": "TX",
+        "stateDescription": "Texas",
+        "sectorid": "RES",
+        "sectorName": "residential",
+        "price": "12.5",
+        "price-units": "cents/kWh",
+        "sales": "(s)",
+        "sales-units": "MWh",
+        "customers": "100",
+    },
+    {
+        "period": "2020",
+        "stateid": "TX",
+        "stateDescription": "Texas",
+        "sectorid": "RES",
+        "sectorName": "residential",
+        "price": "12.0",
+        "price-units": "cents/kWh",
+        "sales": "5.0",
+        "sales-units": "MWh",
+        "customers": "90",
+    },
+    {
+        "period": "2020",
+        "stateid": "CO",
+        "stateDescription": "Colorado",
+        "sectorid": "RES",
+        "sectorName": "residential",
+        "price": "11.0",
+        "price-units": "cents/kWh",
+        "sales": "3.0",
+        "sales-units": "MWh",
+        "customers": "50",
+    },
+]
+
+# Numeric-looking facet ids: a CSV round-trip would turn "3" into 3 and "01"
+# into 1, so the incremental helpers must compare keys as strings.
+_PLANT_ROUTE = "electricity/facility-fuel"
+_PLANT_ROWS: list[dict[str, Any]] = [
+    {"period": "2020-01", "plantid": "3", "gen": "1.5", "gen-units": "MWh"},
+    {"period": "2020-01", "plantid": "01", "gen": "2.5", "gen-units": "MWh"},
+]
+
+# Value columns of the extra synthetic routes (served as their metadata).
+_EXTRA_MEASURES = {"price", "sales", "customers", "gen"}
+
+
+def _tidy_request(
+    rows: dict[str, list[dict[str, Any]]],
+) -> Callable[[str, list[tuple[str, str]]], dict[str, Any]]:
+    """Extend the synthetic API with extra data routes serving ``rows``."""
+
+    def _request(endpoint: str, params: list[tuple[str, str]]) -> dict[str, Any]:
+        route = endpoint.removesuffix("/data")
+        if route in rows and endpoint.endswith("/data"):
+            data = rows[route]
+            return {"total": str(len(data)), "data": list(data)}
+        if route in rows:
+            columns = {c for r in rows[route] for c in r} & _EXTRA_MEASURES
+            return {"routes": [], "data": {c: {"alias": c} for c in sorted(columns)}}
+        return _fake_request(endpoint, params)
+
+    return _request
+
+
+@pytest.fixture
+def tclient(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> EIA:
+    """A client whose synthetic API also serves the multi-measure routes."""
+    eia = EIA(api_key="test-key", cache_dir=tmp_path / "cache")
+    rows = {_MULTI: _MULTI_ROWS, _PLANT_ROUTE: _PLANT_ROWS}
+    monkeypatch.setattr(eia, "_request", _tidy_request(rows))
+    return eia
+
+
+def _assert_tidy_dtypes(frame: pd.DataFrame, dims: list[str]) -> None:
+    """Check the exact tidy columns, their order and dtypes."""
+    assert list(frame.columns) == ["date", *dims, "value", "unit"]
+    assert frame["date"].dtype == "datetime64[ns]"
+    for col in dims:
+        assert frame[col].dtype == "string", col
+    assert frame["value"].dtype == "float64"
+    assert frame["unit"].dtype == "string"
+
+
+def test_snake_case_names() -> None:
+    """API column names become snake_case dimension names."""
+    assert eia_core._snake("stateDescription") == "state_description"
+    assert eia_core._snake("area-name") == "area_name"
+    assert eia_core._snake("stateid") == "stateid"
+
+
+def test_get_data_default_shape_unchanged_by_new_options(client: EIA) -> None:
+    """Without the new flags the result keeps the raw API columns."""
+    frame = client.get_data(_ROUTE, data="price")
+    assert list(frame.columns) == [
+        "date",
+        "period",
+        "stateid",
+        "sectorid",
+        "price",
+        "price-units",
+    ]
+
+
+def test_get_data_tidy_single_measure(client: EIA) -> None:
+    """A single-measure query still carries the ``variable`` dimension."""
+    frame = client.get_data(_ROUTE, data="price", tidy=True)
+    _assert_tidy_dtypes(frame, ["stateid", "sectorid", "variable"])
+    assert frame["variable"].unique().tolist() == ["price"]
+    assert frame["value"].tolist() == [11.0, 12.0, 13.0]
+    assert frame["unit"].unique().tolist() == ["cents/kWh"]
+    assert frame["date"].iloc[0] == pd.Timestamp("2020-01-01")
+
+
+def test_get_data_tidy_multi_measure(tclient: EIA) -> None:
+    """Measures melt into ``variable``; labels become ``<facet>_name``."""
+    frame = tclient.get_data(_MULTI, data=["price", "sales", "customers"], tidy=True)
+    dims = ["stateid", "stateid_name", "sectorid", "sectorid_name", "variable"]
+    _assert_tidy_dtypes(frame, dims)
+    assert len(frame) == 3 * len(_MULTI_ROWS)
+    # Sorted by the dimensions, then date, with a fresh index.
+    expected = frame.sort_values([*dims, "date"]).reset_index(drop=True)
+    pd.testing.assert_frame_equal(frame, expected)
+    assert frame.index.tolist() == list(range(len(frame)))
+    assert frame["stateid"].iloc[0] == "CO"
+    assert frame["stateid_name"].iloc[0] == "Colorado"
+    # Each measure takes its unit from its own "-units" column ...
+    units = frame.groupby("variable")["unit"].first()
+    assert units["price"] == "cents/kWh"
+    assert units["sales"] == "MWh"
+    # ... and a measure without one gets <NA>.
+    assert frame.loc[frame["variable"] == "customers", "unit"].isna().all()
+    # A non-numeric cell becomes NaN, and its row is kept.
+    sales_tx = frame[(frame["variable"] == "sales") & (frame["stateid"] == "TX")]
+    assert sales_tx["value"].isna().tolist() == [False, True]
+
+
+def test_to_tidy_uses_lone_units_column() -> None:
+    """Routes with a single ``units`` column take the unit from it."""
+    raw = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2020-01-02"]),
+            "period": ["2020-01-02"],
+            "series": ["RWTC"],
+            "value": [61.0],
+            "units": ["$/bbl"],
+        }
+    )
+    tidy = eia_core._to_tidy(raw, ["value"])
+    assert list(tidy.columns) == ["date", "series", "variable", "value", "unit"]
+    assert tidy["unit"].tolist() == ["$/bbl"]
+
+
+def test_to_tidy_blank_unit_is_na() -> None:
+    """An empty unit string is reported as missing."""
+    raw = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2020-01-01"]),
+            "x": ["a"],
+            "v": ["1"],
+            "v-units": [""],
+        }
+    )
+    assert eia_core._to_tidy(raw, ["v"])["unit"].isna().all()
+
+
+def test_get_data_tidy_empty(client: EIA, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty result still has the tidy columns and dtypes."""
+    monkeypatch.setattr(client, "_request", lambda *_a: {"total": "0", "data": []})
+    frame = client.get_data(_ROUTE, data="price", tidy=True)
+    assert frame.empty
+    _assert_tidy_dtypes(frame, ["variable"])
+
+
+def test_get_data_as_polars(tclient: EIA) -> None:
+    """``as_polars`` returns a polars frame with the same columns."""
+    pl = pytest.importorskip("polars")
+    pandas_frame = tclient.get_data(_MULTI, data=["price", "sales"], tidy=True)
+    polars_frame = tclient.get_data(
+        _MULTI, data=["price", "sales"], tidy=True, as_polars=True
+    )
+    assert isinstance(polars_frame, pl.DataFrame)
+    assert polars_frame.columns == list(pandas_frame.columns)
+    assert polars_frame.height == len(pandas_frame)
+    default = tclient.get_data(_MULTI, data="price", as_polars=True)
+    assert isinstance(default, pl.DataFrame)
+    assert "price-units" in default.columns
+
+
+def test_as_polars_missing_dependency(
+    client: EIA, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without polars installed, ``as_polars`` explains how to get it."""
+    # A None entry in sys.modules makes ``import polars`` raise ImportError.
+    monkeypatch.setitem(sys.modules, "polars", None)
+    with pytest.raises(ImportError, match=r'pip install "eia-api\[polars\]"'):
+        client.get_data(_ROUTE, data="price", as_polars=True)
+
+
+def test_async_get_data_tidy_matches_sync(
+    client: EIA, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The async client returns the same tidy frame as the sync client."""
+    eia = _async_client(monkeypatch)
+    got = asyncio.run(eia.get_data(_ROUTE, data="price", tidy=True))
+    want = client.get_data(_ROUTE, data="price", tidy=True)
+    pd.testing.assert_frame_equal(got, want)
+
+
+def test_async_get_data_as_polars(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The async client honours ``as_polars`` too."""
+    pl = pytest.importorskip("polars")
+    eia = _async_client(monkeypatch)
+    got = asyncio.run(eia.get_data(_ROUTE, data="price", tidy=True, as_polars=True))
+    assert isinstance(got, pl.DataFrame)
+    assert got.columns == ["date", "stateid", "sectorid", "variable", "value", "unit"]
+
+
+def test_to_parquet_tidy_round_trip(tclient: EIA, tmp_path: Path) -> None:
+    """A tidy Parquet extract reads back equal to the frame."""
+    kwargs: dict[str, Any] = {"route": _MULTI, "data": ["price", "sales"], "tidy": True}
+    path = tclient.to_parquet(tmp_path / "tidy.parquet", **kwargs)
+    pd.testing.assert_frame_equal(pd.read_parquet(path), tclient.get_data(**kwargs))
+
+
+def test_to_parquet_default_round_trip(client: EIA, tmp_path: Path) -> None:
+    """A default-shape Parquet extract reads back equal to the frame."""
+    path = client.to_parquet(tmp_path / "d.parquet", route=_ROUTE, data="price")
+    pd.testing.assert_frame_equal(
+        pd.read_parquet(path), client.get_data(_ROUTE, data="price")
+    )
+
+
+def test_update_csv_tidy_first_run_and_idempotent(tclient: EIA, tmp_path: Path) -> None:
+    """Tidy update_csv writes everything once, then nothing."""
+    path = tmp_path / "tidy.csv"
+    first = tclient.update_csv(path, _MULTI, data=["price", "sales"], tidy=True)
+    assert len(first) == 6
+    assert list(pd.read_csv(path).columns) == list(first.columns)
+    before = path.read_bytes()
+    again = tclient.update_csv(path, _MULTI, data=["price", "sales"], tidy=True)
+    assert again.empty
+    assert path.read_bytes() == before  # untouched
+
+
+def test_update_csv_tidy_appends_only_new(tclient: EIA, tmp_path: Path) -> None:
+    """Only rows missing from the tidy CSV are added."""
+    path = tmp_path / "tidy.csv"
+    full = tclient.get_data(_MULTI, data=["price", "sales"], tidy=True)
+    full.iloc[:4].to_csv(path, index=False)
+    new = tclient.update_csv(path, _MULTI, data=["price", "sales"], tidy=True)
+    assert len(new) == 2
+    written = pd.read_csv(path)
+    assert len(written) == 6
+    # The file comes back sorted by dimensions then date.
+    assert written["date"].tolist() == full["date"].dt.strftime("%Y-%m-%d").tolist()
+
+
+def test_update_csv_tidy_overwrites_revision(tclient: EIA, tmp_path: Path) -> None:
+    """A revised tidy value overwrites the stored one; history is kept."""
+    path = tmp_path / "tidy.csv"
+    tclient.update_csv(path, _MULTI, data="price", tidy=True)
+    stored = pd.read_csv(path)
+    stored.loc[0, "value"] = 999.0
+    # A row the fresh pull no longer has must survive the upsert.
+    old = stored.iloc[[0]].assign(date="2019-01-01", value=1.0)
+    pd.concat([stored, old]).to_csv(path, index=False)
+
+    changed = tclient.update_csv(path, _MULTI, data="price", tidy=True)
+    assert len(changed) == 1
+    assert changed["value"].item() == pytest.approx(11.0)
+    written = pd.read_csv(path)
+    assert len(written) == 4
+    co = written[written["stateid"] == "CO"].reset_index(drop=True)
+    assert co["date"].tolist() == ["2019-01-01", "2020-01-01"]
+    assert co["value"].tolist() == [1.0, 11.0]
+
+
+def test_new_observations_tidy(tclient: EIA) -> None:
+    """new_observations works on a tidy in-memory extract."""
+    full = tclient.get_data(_MULTI, data="price", tidy=True)
+    missing = tclient.new_observations(full.iloc[1:], _MULTI, data="price", tidy=True)
+    pd.testing.assert_frame_equal(missing, full.iloc[:1].reset_index(drop=True))
+    assert tclient.new_observations(full, _MULTI, data="price", tidy=True).empty
+
+
+def test_new_observations_nan_value_is_not_a_revision(tclient: EIA) -> None:
+    """A stored NaN that is still NaN is neither new nor revised."""
+    full = tclient.get_data(_MULTI, data="sales", tidy=True)
+    assert full["value"].isna().any()
+    assert tclient.new_observations(full, _MULTI, data="sales", tidy=True).empty
+
+
+@pytest.mark.parametrize("tidy", [False, True])
+def test_update_csv_numeric_looking_keys_round_trip(
+    tclient: EIA, tmp_path: Path, *, tidy: bool
+) -> None:
+    """Facet ids like "01" survive the CSV round-trip; a rerun adds nothing."""
+    path = tmp_path / "plants.csv"
+    tclient.update_csv(path, _PLANT_ROUTE, data="gen", tidy=tidy)
+    assert tclient.update_csv(path, _PLANT_ROUTE, data="gen", tidy=tidy).empty
+    assert tclient.new_observations(path, _PLANT_ROUTE, data="gen", tidy=tidy).empty
+
+
+def test_cli_get_data_tidy(cli: eia_core._Cli) -> None:
+    """``get-data --tidy`` prints the tidy columns."""
+    text = fire.Fire(cli, command=["get_data", _ROUTE, "--data", "price", "--tidy"])
+    header = text.splitlines()[0].split()
+    assert header == ["date", "stateid", "sectorid", "variable", "value", "unit"]
+
+
+def test_cli_to_parquet_tidy(cli: eia_core._Cli, tmp_path: Path) -> None:
+    """``to-parquet --tidy`` writes the tidy shape."""
+    out = tmp_path / "t.parquet"
+    command = ["to-parquet", str(out), "--route", _ROUTE, "--data", "price", "--tidy"]
+    fire.Fire(cli, command=command)
+    assert list(pd.read_parquet(out).columns)[-2:] == ["value", "unit"]
+
+
+def test_cli_get_data_out_tidy(cli: eia_core._Cli, tmp_path: Path) -> None:
+    """``get-data --out x.csv --tidy`` writes the tidy shape."""
+    out = tmp_path / "t.csv"
+    command = ["get-data", _ROUTE, "--data", "price", "--out", str(out), "--tidy"]
+    fire.Fire(cli, command=command)
+    assert "variable" in pd.read_csv(out).columns
+
+
+def test_cli_update_csv_tidy(cli: eia_core._Cli, tmp_path: Path) -> None:
+    """``update-csv --tidy`` creates a tidy CSV, then reports nothing new."""
+    out = tmp_path / "t.csv"
+    command = ["update-csv", str(out), "--route", _ROUTE, "--data", "price", "--tidy"]
+    assert "3 new/revised rows" in fire.Fire(cli, command=command)
+    assert "unit" in pd.read_csv(out).columns
+    assert "0 new/revised rows" in fire.Fire(cli, command=command)

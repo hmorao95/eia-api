@@ -67,7 +67,7 @@ import sys  # Writes clean CLI error messages to stderr.
 import time  # Compares a cached file's mtime against the freshness TTL.
 from dataclasses import dataclass  # Builds the immutable Route value type.
 from pathlib import Path  # Cross-platform filesystem paths for the cache/outputs.
-from typing import TYPE_CHECKING, Any, ClassVar  # Typing-only helpers.
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, overload  # Typing helpers.
 
 import httpx  # Async HTTP client backing :class:`AsyncEIA`.
 import pandas as pd  # The core tabular data type used throughout the module.
@@ -77,6 +77,9 @@ if TYPE_CHECKING:
     # Imported only for type checking to keep the runtime import graph small;
     # these names are used purely in annotations.
     from collections.abc import Iterable, Mapping, Sequence
+
+    # polars is an optional extra, imported lazily at runtime (``_as_polars``).
+    import polars as pl
 
 # Only the public surface is exported; helpers and the CLI facade stay private.
 __all__ = ["EIA", "AsyncEIA", "Route"]
@@ -413,6 +416,208 @@ def _rows_to_frame(rows: list[dict[str, Any]], columns: list[str]) -> pd.DataFra
     if "period" in frame.columns:
         frame.insert(0, "date", _parse_period_series(frame["period"]))
     return frame
+
+
+# Suffix of the per-measure unit columns the API pairs with each value column
+# (``price`` -> ``price-units``).
+_UNITS_SUFFIX = "-units"
+
+# Facet label columns end in "Description"/"Name"/"-name"/"-description"
+# (``stateDescription``, ``sectorName``, ``area-name``, ...); the API places each
+# one straight after the facet id it describes.
+_LABEL_COLUMN = re.compile(r"(description|name)$", re.IGNORECASE)
+
+# The fixed leading and trailing columns of the tidy shape.
+_TIDY_VALUE_COLUMNS = ("value", "unit")
+
+
+def _snake(name: str) -> str:
+    """
+    Convert an API column name to snake_case.
+
+    Splits camelCase boundaries and turns any run of non-alphanumeric characters
+    (hyphens, spaces) into a single underscore, so ``stateDescription`` becomes
+    ``state_description`` and ``area-name`` becomes ``area_name``.
+
+    Args:
+        name (str): The raw column name.
+
+    Returns:
+        str: The lower-case snake_case name.
+    """
+    spaced = re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name)
+    return re.sub(r"[^0-9A-Za-z]+", "_", spaced).strip("_").lower()
+
+
+def _dimension_map(frame: pd.DataFrame, columns: Sequence[str]) -> dict[str, str]:
+    """
+    Map a raw frame's facet columns to their tidy dimension names.
+
+    Every column that is not the date/period, a requested value column or a unit
+    column is a facet column. A facet *id* keeps its (snake_cased) name; a label
+    column (one ending in ``Description``/``Name``) that directly follows an id
+    becomes ``<id>_name``, so ``stateid, stateDescription`` maps to
+    ``stateid, stateid_name``. A label with no id in front of it is kept as a
+    dimension in its own right.
+
+    Args:
+        frame (pd.DataFrame): The default-shape frame from :meth:`EIA.get_data`.
+        columns (Sequence[str]): The requested value-column ids.
+
+    Returns:
+        dict[str, str]: Raw column name -> tidy dimension name, in column order.
+    """
+    skip = {"date", "period", "units", *columns}
+    mapping: dict[str, str] = {}
+    last_id: str | None = None
+    for col in map(str, frame.columns):
+        if col in skip or col.endswith(_UNITS_SUFFIX):
+            continue
+        if _LABEL_COLUMN.search(col) and last_id is not None:
+            # The label of the facet id just before it; only one label per id.
+            mapping[col] = f"{last_id}_name"
+            last_id = None
+            continue
+        mapping[col] = last_id = _snake(col)
+    return mapping
+
+
+def _to_tidy(frame: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
+    """
+    Reshape a default :meth:`EIA.get_data` frame into the shared tidy shape.
+
+    Shared by the sync and async clients. Each requested measure is melted into
+    its own block of rows: the facet columns become the dimensions (ids under
+    their snake_case names, labels as ``<id>_name``), the measure id goes into a
+    ``variable`` column, its number into ``value`` and its unit from the paired
+    ``<measure>-units`` column (or a lone ``units`` column) into ``unit``. The
+    raw ``period`` label is dropped; ``date`` is its parsed period start.
+
+    Args:
+        frame (pd.DataFrame): The default-shape frame from :meth:`EIA.get_data`.
+        columns (Sequence[str]): The requested value-column ids.
+
+    Returns:
+        pd.DataFrame: Columns ``date``, the dimension columns, ``variable``,
+        ``value`` (float64) and ``unit`` (string, ``<NA>`` when absent), sorted
+        by the dimensions then ``date`` with a fresh index.
+    """
+    dims = _dimension_map(frame, columns)
+    dim_cols = [*dims.values(), "variable"]
+    measures = [c for c in columns if c in frame.columns]
+    if frame.empty or not measures:
+        # Nothing to melt: return the empty tidy shape with its dtypes.
+        return pd.DataFrame(
+            {
+                "date": pd.Series(dtype="datetime64[ns]"),
+                **{c: pd.Series(dtype="string") for c in dim_cols},
+                "value": pd.Series(dtype="float64"),
+                "unit": pd.Series(dtype="string"),
+            }
+        )
+    dates = (
+        frame["date"]
+        if "date" in frame.columns
+        else pd.Series(pd.NaT, index=frame.index)
+    )
+    pieces: list[pd.DataFrame] = []
+    for measure in measures:
+        part = frame[list(dims)].rename(columns=dims)
+        part.insert(0, "date", dates)
+        part["variable"] = measure
+        part["value"] = pd.to_numeric(frame[measure], errors="coerce")
+        # Prefer the measure's own "<measure>-units" column; some routes carry
+        # a single "units" column instead; otherwise the unit is unknown.
+        unit_col = next(
+            (c for c in (f"{measure}{_UNITS_SUFFIX}", "units") if c in frame.columns),
+            None,
+        )
+        part["unit"] = frame[unit_col] if unit_col else None
+        pieces.append(part)
+    tidy = pd.concat(pieces, ignore_index=True)
+    tidy["date"] = pd.to_datetime(tidy["date"]).astype("datetime64[ns]")
+    for col in dim_cols:
+        tidy[col] = tidy[col].astype("string")
+    tidy["value"] = tidy["value"].astype("float64")
+    # A blank unit string carries no information, so treat it as missing.
+    tidy["unit"] = tidy["unit"].astype("string").replace("", pd.NA)
+    return (
+        tidy[["date", *dim_cols, *_TIDY_VALUE_COLUMNS]]
+        .sort_values([*dim_cols, "date"], kind="stable")
+        .reset_index(drop=True)
+    )
+
+
+def _as_polars(frame: pd.DataFrame) -> pl.DataFrame:
+    """
+    Convert a pandas result to a polars DataFrame, importing polars lazily.
+
+    polars is an optional extra, so it is only imported when a caller asks for
+    ``as_polars=True``.
+
+    Args:
+        frame (pd.DataFrame): The pandas result to convert.
+
+    Returns:
+        pl.DataFrame: ``polars.from_pandas(frame)``.
+
+    Raises:
+        ImportError: If polars is not installed.
+    """
+    try:
+        import polars as pl
+    except ImportError as exc:
+        msg = 'polars is not installed; install it with pip install "eia-api[polars]"'
+        raise ImportError(msg) from exc
+    return pl.from_pandas(frame)
+
+
+def _finish(
+    frame: pd.DataFrame, columns: Sequence[str], *, tidy: bool, as_polars: bool
+) -> pd.DataFrame | pl.DataFrame:
+    """
+    Apply the opt-in output options to a default-shape result.
+
+    Shared by the sync and async ``get_data``.
+
+    Args:
+        frame (pd.DataFrame): The default-shape result.
+        columns (Sequence[str]): The requested value-column ids.
+        tidy (bool): Reshape into the tidy long shape (see :func:`_to_tidy`).
+        as_polars (bool): Return a polars DataFrame instead of pandas.
+
+    Returns:
+        pd.DataFrame | pl.DataFrame: The result in the requested shape/library.
+    """
+    if tidy:
+        frame = _to_tidy(frame, columns)
+    return _as_polars(frame) if as_polars else frame
+
+
+def _key_strings(frame: pd.DataFrame, key_cols: Sequence[str]) -> pd.DataFrame:
+    """
+    Render a frame's key columns as comparable strings.
+
+    A CSV round-trip changes dtypes (a numeric-looking facet id comes back as an
+    int, a date as text), so both sides of a key comparison are cast to strings
+    first. ``date`` is normalised to one ISO format and missing values to ``""``.
+
+    Args:
+        frame (pd.DataFrame): A fetched or stored frame.
+        key_cols (Sequence[str]): The identifying columns.
+
+    Returns:
+        pd.DataFrame: The key columns as plain strings, same index as ``frame``.
+    """
+    out = pd.DataFrame(index=frame.index)
+    for col in key_cols:
+        series = frame[col]
+        if col == "date":
+            series = pd.to_datetime(series, format="ISO8601").dt.strftime(
+                "%Y-%m-%dT%H:%M:%S"
+            )
+        out[col] = series.astype("string").fillna("").astype(str)
+    return out
 
 
 @dataclass(frozen=True)
@@ -863,6 +1068,60 @@ class EIA:
         """
         return _parse_period_series(period)
 
+    @overload
+    def get_data(
+        self,
+        route: str,
+        data: str | Iterable[str] | None = ...,
+        facets: Mapping[str, str | Iterable[str]] | None = ...,
+        frequency: str | None = ...,
+        start: str | None = ...,
+        end: str | None = ...,
+        sort: Sequence[tuple[str, str]] | None = ...,
+        offset: int = ...,
+        length: int = ...,
+        max_rows: int | None = ...,
+        *,
+        tidy: bool = ...,
+        as_polars: Literal[False] = ...,
+    ) -> pd.DataFrame: ...
+
+    @overload
+    def get_data(
+        self,
+        route: str,
+        data: str | Iterable[str] | None = ...,
+        facets: Mapping[str, str | Iterable[str]] | None = ...,
+        frequency: str | None = ...,
+        start: str | None = ...,
+        end: str | None = ...,
+        sort: Sequence[tuple[str, str]] | None = ...,
+        offset: int = ...,
+        length: int = ...,
+        max_rows: int | None = ...,
+        *,
+        tidy: bool = ...,
+        as_polars: Literal[True],
+    ) -> pl.DataFrame: ...
+
+    @overload
+    def get_data(
+        self,
+        route: str,
+        data: str | Iterable[str] | None = ...,
+        facets: Mapping[str, str | Iterable[str]] | None = ...,
+        frequency: str | None = ...,
+        start: str | None = ...,
+        end: str | None = ...,
+        sort: Sequence[tuple[str, str]] | None = ...,
+        offset: int = ...,
+        length: int = ...,
+        max_rows: int | None = ...,
+        *,
+        tidy: bool = ...,
+        as_polars: bool,
+    ) -> pd.DataFrame | pl.DataFrame: ...
+
     def get_data(
         self,
         route: str,
@@ -875,7 +1134,10 @@ class EIA:
         offset: int = 0,
         length: int = _MAX_LENGTH,
         max_rows: int | None = None,
-    ) -> pd.DataFrame:
+        *,
+        tidy: bool = False,
+        as_polars: bool = False,
+    ) -> pd.DataFrame | pl.DataFrame:
         """
         Fetch a dataset's rows into a tidy DataFrame, paginating as needed.
 
@@ -910,12 +1172,23 @@ class EIA:
             length (int): Page size per request, capped at 5000.
             max_rows (int | None): Stop after retrieving this many rows. ``None``
                 (default) fetches the entire result.
+            tidy (bool): Return a standard long shape instead of the default
+                one: columns ``date`` (period start), the facet
+                ids as dimensions (snake_case, with a facet's label column as
+                ``<facet>_name`` where the API sends one), ``variable`` (the
+                measure id), ``value`` (float64) and ``unit`` (from the
+                ``<measure>-units`` column; ``<NA>`` when absent). One row per
+                measure and observation, sorted by the dimensions then ``date``.
+            as_polars (bool): Return a ``polars.DataFrame`` (works with
+                ``tidy``). Needs the optional ``polars`` extra.
 
         Returns:
-            pd.DataFrame: The tidy result. Columns are ``date`` then ``period``,
-            the facet columns, and each requested value column with its paired
-            ``<column>-units`` column (exact set as returned by the API). Empty
-            when the query matches nothing.
+            pd.DataFrame | pl.DataFrame: By default the result as returned by
+            the API: columns ``date`` then ``period``, the facet columns, and
+            each requested value column with its paired ``<column>-units``
+            column (exact set as returned by the API). Empty when the query
+            matches nothing. ``tidy`` and ``as_polars`` change the shape and
+            the library as described above.
 
         Raises:
             ValueError: If ``length`` is not positive.
@@ -944,7 +1217,9 @@ class EIA:
             page=page,
             max_rows=max_rows,
         )
-        return self._to_frame(rows, columns)
+        return _finish(
+            self._to_frame(rows, columns), columns, tidy=tidy, as_polars=as_polars
+        )
 
     def _paginate(
         self,
@@ -1097,7 +1372,7 @@ class EIA:
         Args:
             path (str | Path): Destination CSV path.
             **kwargs (Any): Forwarded verbatim to :meth:`get_data` (``route``,
-                ``data``, ``facets``, ``frequency``, ``start``, ``end``, ...).
+                ``data``, ``facets``, ``frequency``, ``start``, ``end``, ``tidy``, ...).
 
         Returns:
             Path: The path that was written.
@@ -1118,7 +1393,8 @@ class EIA:
 
         Args:
             path (str | Path): Destination ``.xlsx`` path.
-            **kwargs (Any): Forwarded verbatim to :meth:`get_data`.
+            **kwargs (Any): Forwarded verbatim to :meth:`get_data` (including
+                ``tidy=True``).
 
         Returns:
             Path: The path that was written.
@@ -1142,7 +1418,8 @@ class EIA:
 
         Args:
             path (str | Path): Destination ``.parquet`` path.
-            **kwargs (Any): Forwarded verbatim to :meth:`get_data`.
+            **kwargs (Any): Forwarded verbatim to :meth:`get_data` (including
+                ``tidy=True``).
 
         Returns:
             Path: The path that was written.
@@ -1161,7 +1438,8 @@ class EIA:
 
         Args:
             path (str | Path): Destination ``.json`` path.
-            **kwargs (Any): Forwarded verbatim to :meth:`get_data`.
+            **kwargs (Any): Forwarded verbatim to :meth:`get_data` (including
+                ``tidy=True``).
 
         Returns:
             Path: The path that was written.
@@ -1199,8 +1477,32 @@ class EIA:
         ]
 
     @classmethod
+    def _row_key(
+        cls, frame: pd.DataFrame, value_cols: list[str], *, tidy: bool
+    ) -> tuple[list[str], list[str]]:
+        """
+        Return a frame's key columns and the value columns compared for revisions.
+
+        In the default shape the key is ``period`` plus the facet columns and the
+        compared values are the requested measures. In the tidy shape there is no
+        ``period``, so ``date`` joins the key (dimensions plus ``variable`` plus
+        ``date``) and the only compared value is ``value``.
+
+        Args:
+            frame (pd.DataFrame): A fetched frame in either shape.
+            value_cols (list[str]): The requested value-column ids.
+            tidy (bool): Whether ``frame`` is in the tidy shape.
+
+        Returns:
+            tuple[list[str], list[str]]: The key columns and the value columns.
+        """
+        if tidy:
+            keys = [c for c in frame.columns if c not in _TIDY_VALUE_COLUMNS]
+            return keys, ["value"]
+        return cls._key_columns(frame, value_cols), value_cols
+
+    @staticmethod
     def _select_new(
-        cls,
         fresh: pd.DataFrame,
         existing: pd.DataFrame,
         key_cols: list[str],
@@ -1214,7 +1516,9 @@ class EIA:
         A fresh row is selected when its key is absent from ``existing`` (a
         brand-new period, or a facet combination never extracted before). When
         ``include_revisions`` is true, rows whose key already exists but whose
-        value columns differ (an EIA back-revision) are also selected.
+        value columns differ (an EIA back-revision) are also selected; two
+        missing values count as equal. Keys are compared as strings, so a CSV
+        round-trip that changed their dtypes does not defeat the match.
 
         Args:
             fresh (pd.DataFrame): A freshly fetched long DataFrame.
@@ -1232,26 +1536,26 @@ class EIA:
         if existing.empty:
             return fresh
 
-        # Left-join each fresh row to its previously stored values on the key so
-        # unmatched rows get NaN in the "_prev_*" companions.
+        # Left-join each fresh row (by its string key) to the stored values; the
+        # merge indicator flags keys that were never stored.
         prior_cols = [c for c in value_cols if c in existing.columns]
         renamed = {c: f"_prev_{c}" for c in prior_cols}
-        prior = existing[[*key_cols, *prior_cols]].rename(columns=renamed)
-        merged = fresh.merge(prior, on=key_cols, how="left")
-
-        # A row is new when its key was never stored: detect that via the first
-        # value column's missing companion (a left-join miss). With no prior
-        # value columns at all, treat every row as new.
-        selected = (
-            merged[f"_prev_{prior_cols[0]}"].isna()
-            if prior_cols
-            else pd.Series(data=True, index=merged.index)
+        left = _key_strings(fresh, key_cols)
+        for col in prior_cols:
+            left[col] = fresh[col]
+        prior = (
+            _key_strings(existing, key_cols)
+            .join(existing[prior_cols].rename(columns=renamed))
+            .drop_duplicates(subset=key_cols, keep="last")
         )
-        if include_revisions and prior_cols:
-            # A row is revised when a prior value exists but any measure differs.
+        merged = left.merge(prior, on=key_cols, how="left", indicator=True)
+        selected = merged["_merge"] == "left_only"
+        if include_revisions:
+            # A stored row is revised when any measure differs (NaN == NaN).
             for col in prior_cols:
-                prev = merged[f"_prev_{col}"]
-                selected |= prev.notna() & (merged[col] != prev)
+                now, prev = merged[col], merged[f"_prev_{col}"]
+                same = (now == prev) | (now.isna() & prev.isna())
+                selected |= (merged["_merge"] == "both") & ~same
         # Index back into ``fresh`` (via a positional mask) to keep its columns.
         return fresh[selected.to_numpy()].reset_index(drop=True)
 
@@ -1275,7 +1579,8 @@ class EIA:
 
         This is the file-free building block behind :meth:`update_csv`; reach for
         it when the delta should be returned in memory to append to a custom store
-        (a database, a different file format, and so on).
+        (a database, a different file format, and so on). Pass ``tidy=True`` when
+        ``existing`` is in the tidy shape.
 
         Args:
             existing (pd.DataFrame | str | Path): The prior extract, as a long
@@ -1286,21 +1591,25 @@ class EIA:
             include_revisions (bool): Also include values EIA has revised, not
                 just entirely new observations.
             **kwargs (Any): Further filters forwarded to :meth:`get_data`
-                (``facets``, ``frequency``, ``start``, ``end``, ...).
+                (``facets``, ``frequency``, ``start``, ``end``, ``tidy``, ...).
 
         Returns:
             pd.DataFrame: A long DataFrame of just the missing (and optionally
             revised) rows; empty when ``existing`` is already up to date.
         """
         value_cols = self._resolve_data(route, data)
-        fresh = self.get_data(route, data=value_cols, **kwargs)
-        existing_frame = self._coerce_frame(existing, fresh)
-        key_cols = self._key_columns(fresh, value_cols)
+        fresh: pd.DataFrame = self.get_data(
+            route, data=value_cols, as_polars=False, **kwargs
+        )
+        key_cols, compare_cols = self._row_key(
+            fresh, value_cols, tidy=bool(kwargs.get("tidy"))
+        )
+        existing_frame = self._coerce_frame(existing, fresh, compare_cols)
         new = self._select_new(
             fresh,
             existing_frame,
             key_cols,
-            value_cols,
+            compare_cols,
             include_revisions=include_revisions,
         )
         _log.info(
@@ -1310,19 +1619,23 @@ class EIA:
 
     @staticmethod
     def _coerce_frame(
-        existing: pd.DataFrame | str | Path, fresh: pd.DataFrame
+        existing: pd.DataFrame | str | Path,
+        fresh: pd.DataFrame,
+        value_cols: Sequence[str] = (),
     ) -> pd.DataFrame:
         """
         Normalise an "already extracted" source into a comparable DataFrame.
 
         Accepts either an in-memory frame (copied so the caller is not mutated) or
-        a path to a previously written CSV (read from disk). The ``period`` column
-        is cast to string on both sides so a key match is not defeated by dtype
-        differences between a fresh pull and a CSV round-trip.
+        a path to a previously written CSV. A CSV is read as text, so key columns
+        keep their exact spelling (``"01"`` stays ``"01"``), and the value columns
+        are then parsed back into numbers.
 
         Args:
             existing (pd.DataFrame | str | Path): The prior extract or a CSV path.
             fresh (pd.DataFrame): The freshly fetched frame (used for its shape).
+            value_cols (Sequence[str]): Numeric value columns to parse after
+                reading a CSV.
 
         Returns:
             pd.DataFrame: A comparable copy of the prior extract; an empty frame
@@ -1332,7 +1645,10 @@ class EIA:
             path = Path(existing)
             if not path.exists():
                 return fresh.iloc[0:0]
-            frame = pd.read_csv(path)
+            frame = pd.read_csv(path, dtype=str)
+            for col in value_cols:
+                if col in frame.columns:
+                    frame[col] = pd.to_numeric(frame[col], errors="coerce")
         else:
             frame = existing.copy()
         if "period" in frame.columns:
@@ -1351,10 +1667,12 @@ class EIA:
 
         On the first run (the file does not yet exist) this writes the full
         extract. On later runs it reads what was already saved, fetches the latest
-        data, and upserts on the row key (period plus facet columns) — appending
-        new observations and overwriting any values EIA has since revised.
-        Re-running it keeps recently published periods correct rather than frozen
-        at their first, preliminary value.
+        data, and upserts on the row key (period plus facet columns; in the tidy
+        shape the dimensions, ``variable`` and ``date``) — appending new
+        observations and overwriting any values EIA has since revised, while
+        keeping stored history the fresh pull no longer covers. Re-running it
+        keeps recently published periods correct rather than frozen at their
+        first, preliminary value. Use the same ``tidy`` setting on every run.
 
         Args:
             path (str | Path): Long-format CSV to create or update in place.
@@ -1362,15 +1680,18 @@ class EIA:
             data (str | Iterable[str] | None): Value column(s) to fetch (see
                 :meth:`get_data`).
             **kwargs (Any): Further filters forwarded to :meth:`get_data`
-                (``facets``, ``frequency``, ``start``, ``end``, ...).
+                (``facets``, ``frequency``, ``start``, ``end``, ``tidy``, ...).
 
         Returns:
             pd.DataFrame: The rows that were newly added or revised; empty when
             the file was already up to date.
         """
         path = Path(path)
+        tidy = bool(kwargs.get("tidy"))
         value_cols = self._resolve_data(route, data)
-        fresh = self.get_data(route, data=value_cols, **kwargs)
+        fresh: pd.DataFrame = self.get_data(
+            route, data=value_cols, as_polars=False, **kwargs
+        )
 
         # First run: nothing on disk yet, so write the whole extract and return
         # it (every row is "new").
@@ -1379,23 +1700,31 @@ class EIA:
             _log.info("Created %s with %d rows", path, len(fresh))
             return fresh
 
-        existing = self._coerce_frame(path, fresh)
-        key_cols = self._key_columns(fresh, value_cols)
-        changed = self._select_new(fresh, existing, key_cols, value_cols)
+        key_cols, compare_cols = self._row_key(fresh, value_cols, tidy=tidy)
+        existing = self._coerce_frame(path, fresh, compare_cols)
+        changed = self._select_new(fresh, existing, key_cols, compare_cols)
         if changed.empty:
             # Already up to date; leave the file untouched.
             _log.info("%s is already up to date", path)
             return changed
 
         # Upsert: concatenate old and fresh, then keep the fresh row wherever a
-        # key collides (``keep="last"``) so revised values overwrite stale ones
-        # while history absent from ``fresh`` is retained.
-        combined = (
-            pd.concat([existing, fresh], ignore_index=True)
-            .drop_duplicates(subset=key_cols, keep="last")
-            .sort_values(key_cols)
-            .reset_index(drop=True)
+        # (string) key collides, so revised values overwrite stale ones while
+        # history absent from ``fresh`` is retained.
+        combined = pd.concat([existing, fresh], ignore_index=True)
+        keys = _key_strings(combined, key_cols)
+        combined = combined[~keys.duplicated(keep="last").to_numpy()]
+        if "date" in combined.columns:
+            # Stored dates are text and fresh ones Timestamps; unify the column
+            # so the file keeps one date format.
+            combined["date"] = pd.to_datetime(combined["date"], format="ISO8601")
+        # The default shape sorts by its key (period first); the tidy shape by
+        # its dimensions, then date.
+        sort_cols = (
+            [*(c for c in key_cols if c != "date"), "date"] if tidy else key_cols
         )
+        order = _key_strings(combined, sort_cols).sort_values(sort_cols).index
+        combined = combined.loc[order].reset_index(drop=True)
         combined.to_csv(path, index=False)
         _log.info(
             "Upserted %d new/revised rows into %s (%d rows total)",
@@ -1704,6 +2033,60 @@ class AsyncEIA:
             return [data]
         return list(data)
 
+    @overload
+    async def get_data(
+        self,
+        route: str,
+        data: str | Iterable[str] | None = ...,
+        facets: Mapping[str, str | Iterable[str]] | None = ...,
+        frequency: str | None = ...,
+        start: str | None = ...,
+        end: str | None = ...,
+        sort: Sequence[tuple[str, str]] | None = ...,
+        offset: int = ...,
+        length: int = ...,
+        max_rows: int | None = ...,
+        *,
+        tidy: bool = ...,
+        as_polars: Literal[False] = ...,
+    ) -> pd.DataFrame: ...
+
+    @overload
+    async def get_data(
+        self,
+        route: str,
+        data: str | Iterable[str] | None = ...,
+        facets: Mapping[str, str | Iterable[str]] | None = ...,
+        frequency: str | None = ...,
+        start: str | None = ...,
+        end: str | None = ...,
+        sort: Sequence[tuple[str, str]] | None = ...,
+        offset: int = ...,
+        length: int = ...,
+        max_rows: int | None = ...,
+        *,
+        tidy: bool = ...,
+        as_polars: Literal[True],
+    ) -> pl.DataFrame: ...
+
+    @overload
+    async def get_data(
+        self,
+        route: str,
+        data: str | Iterable[str] | None = ...,
+        facets: Mapping[str, str | Iterable[str]] | None = ...,
+        frequency: str | None = ...,
+        start: str | None = ...,
+        end: str | None = ...,
+        sort: Sequence[tuple[str, str]] | None = ...,
+        offset: int = ...,
+        length: int = ...,
+        max_rows: int | None = ...,
+        *,
+        tidy: bool = ...,
+        as_polars: bool,
+    ) -> pd.DataFrame | pl.DataFrame: ...
+
     async def get_data(
         self,
         route: str,
@@ -1716,7 +2099,10 @@ class AsyncEIA:
         offset: int = 0,
         length: int = _MAX_LENGTH,
         max_rows: int | None = None,
-    ) -> pd.DataFrame:
+        *,
+        tidy: bool = False,
+        as_polars: bool = False,
+    ) -> pd.DataFrame | pl.DataFrame:
         """
         Fetch a dataset's rows into a tidy DataFrame (async :meth:`EIA.get_data`).
 
@@ -1736,9 +2122,13 @@ class AsyncEIA:
             offset (int): Starting row offset (pagination is automatic).
             length (int): Page size per request, capped at 5000.
             max_rows (int | None): Stop after this many rows; ``None`` for all.
+            tidy (bool): Return the tidy long shape (see :meth:`EIA.get_data`).
+            as_polars (bool): Return a ``polars.DataFrame``; needs the optional
+                ``polars`` extra.
 
         Returns:
-            pd.DataFrame: The tidy result, identical in shape to the sync client.
+            pd.DataFrame | pl.DataFrame: The result, identical in shape to the
+            sync client for the same arguments.
 
         Raises:
             ValueError: If ``length`` is not positive.
@@ -1787,7 +2177,9 @@ class AsyncEIA:
             if total is not None and offset >= int(total):
                 break
         _log.info("Fetched %d rows from %s in %d page(s)", len(rows), route, pages)
-        return _rows_to_frame(rows, columns)
+        return _finish(
+            _rows_to_frame(rows, columns), columns, tidy=tidy, as_polars=as_polars
+        )
 
 
 # The async client is also reachable as ``EIA.AsyncAPI`` for parity with the
@@ -2038,6 +2430,8 @@ class _Cli:
         length: int = _MAX_LENGTH,
         max_rows: int | None = None,
         out: str | None = None,
+        *,
+        tidy: bool = False,
     ) -> str:
         """
         Fetch data and either print it or write it to ``out``.
@@ -2056,6 +2450,8 @@ class _Cli:
             out (str | None): If given, write to this path instead of printing.
                 The extension selects the format: ``.xlsx``/``.xls`` Excel,
                 ``.parquet`` Parquet, ``.json`` JSON, anything else CSV.
+            tidy (bool): Write/print the tidy long shape (``date``, dimensions,
+                ``variable``, ``value``, ``unit``) instead of the default one.
 
         Returns:
             str: The rendered table, or a status line when ``out`` is used.
@@ -2071,6 +2467,7 @@ class _Cli:
                 offset=offset,
                 length=length,
                 max_rows=max_rows,
+                tidy=tidy,
             )
             return frame.to_string(index=False)
         out = self._resolve_out(out)
@@ -2095,6 +2492,7 @@ class _Cli:
             offset=offset,
             length=length,
             max_rows=max_rows,
+            tidy=tidy,
         )
         return f"Wrote {out}"
 
@@ -2108,6 +2506,8 @@ class _Cli:
         start: str | None = None,
         end: str | None = None,
         max_rows: int | None = None,
+        *,
+        tidy: bool = False,
     ) -> str:
         """
         Write data to a CSV file and report where it went.
@@ -2121,6 +2521,8 @@ class _Cli:
             start (str | None): Inclusive lower period bound.
             end (str | None): Inclusive upper period bound.
             max_rows (int | None): Stop after this many rows.
+            tidy (bool): Write/print the tidy long shape (``date``, dimensions,
+                ``variable``, ``value``, ``unit``) instead of the default one.
 
         Returns:
             str: A status line naming the file written.
@@ -2135,6 +2537,7 @@ class _Cli:
             start=_as_text(start),
             end=_as_text(end),
             max_rows=max_rows,
+            tidy=tidy,
         )
         return f"Wrote {path}"
 
@@ -2148,6 +2551,8 @@ class _Cli:
         start: str | None = None,
         end: str | None = None,
         max_rows: int | None = None,
+        *,
+        tidy: bool = False,
     ) -> str:
         """
         Write data to an Excel (.xlsx) workbook and report where it went.
@@ -2161,6 +2566,8 @@ class _Cli:
             start (str | None): Inclusive lower period bound.
             end (str | None): Inclusive upper period bound.
             max_rows (int | None): Stop after this many rows.
+            tidy (bool): Write/print the tidy long shape (``date``, dimensions,
+                ``variable``, ``value``, ``unit``) instead of the default one.
 
         Returns:
             str: A status line naming the file written.
@@ -2175,6 +2582,7 @@ class _Cli:
             start=_as_text(start),
             end=_as_text(end),
             max_rows=max_rows,
+            tidy=tidy,
         )
         return f"Wrote {path}"
 
@@ -2188,6 +2596,8 @@ class _Cli:
         start: str | None = None,
         end: str | None = None,
         max_rows: int | None = None,
+        *,
+        tidy: bool = False,
     ) -> str:
         """
         Write data to a Parquet file and report where it went.
@@ -2201,6 +2611,8 @@ class _Cli:
             start (str | None): Inclusive lower period bound.
             end (str | None): Inclusive upper period bound.
             max_rows (int | None): Stop after this many rows.
+            tidy (bool): Write/print the tidy long shape (``date``, dimensions,
+                ``variable``, ``value``, ``unit``) instead of the default one.
 
         Returns:
             str: A status line naming the file written.
@@ -2215,6 +2627,7 @@ class _Cli:
             start=_as_text(start),
             end=_as_text(end),
             max_rows=max_rows,
+            tidy=tidy,
         )
         return f"Wrote {path}"
 
@@ -2228,6 +2641,8 @@ class _Cli:
         start: str | None = None,
         end: str | None = None,
         max_rows: int | None = None,
+        *,
+        tidy: bool = False,
     ) -> str:
         """
         Write data to a JSON file and report where it went.
@@ -2241,6 +2656,8 @@ class _Cli:
             start (str | None): Inclusive lower period bound.
             end (str | None): Inclusive upper period bound.
             max_rows (int | None): Stop after this many rows.
+            tidy (bool): Write/print the tidy long shape (``date``, dimensions,
+                ``variable``, ``value``, ``unit``) instead of the default one.
 
         Returns:
             str: A status line naming the file written.
@@ -2255,6 +2672,7 @@ class _Cli:
             start=_as_text(start),
             end=_as_text(end),
             max_rows=max_rows,
+            tidy=tidy,
         )
         return f"Wrote {path}"
 
@@ -2267,6 +2685,8 @@ class _Cli:
         frequency: str | None = None,
         start: str | None = None,
         end: str | None = None,
+        *,
+        tidy: bool = False,
     ) -> str:
         """
         Incrementally update a long-format CSV and report the row count.
@@ -2279,6 +2699,8 @@ class _Cli:
             frequency (str | None): Requested periodicity.
             start (str | None): Inclusive lower period bound.
             end (str | None): Inclusive upper period bound.
+            tidy (bool): Write/print the tidy long shape (``date``, dimensions,
+                ``variable``, ``value``, ``unit``) instead of the default one.
 
         Returns:
             str: A status line with the number of rows added or revised.
@@ -2292,6 +2714,7 @@ class _Cli:
             frequency=frequency,
             start=_as_text(start),
             end=_as_text(end),
+            tidy=tidy,
         )
         return f"Wrote {len(changed):,} new/revised rows -> {path}"
 
