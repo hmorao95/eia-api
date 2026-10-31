@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- `--log-file` no longer gets ANSI color codes in tracebacks on Python 3.13+:
+  the file handler re-renders tracebacks instead of reusing the console's
+  colored copy.
+
 - The README, the installation docs and `CITATION.cff` no longer point to PyPI,
   where the package is not published: the PyPI badge and identifier are removed,
   installation uses the GitHub repository, and the citation links to it.
