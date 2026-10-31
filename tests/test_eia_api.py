@@ -819,6 +819,113 @@ def test_cli_get_data_with_facets(cli: eia_core._Cli) -> None:
     assert "CO" in out
 
 
+class _Recorder:
+    """Stand-in client that records the facets the CLI passes on."""
+
+    def __init__(self, calls: list[object]) -> None:
+        """Keep the list that each call's ``facets`` is appended to."""
+        self.calls = calls
+
+    def get_data(self, _route: str, **kwargs: object) -> pd.DataFrame:
+        """Record the facets and return an empty frame."""
+        self.calls.append(kwargs["facets"])
+        return pd.DataFrame()
+
+    def to_csv(self, _path: str, **kwargs: object) -> None:
+        """Record the facets."""
+        self.calls.append(kwargs["facets"])
+
+    def update_csv(self, _path: str, **kwargs: object) -> pd.DataFrame:
+        """Record the facets and report no changed rows."""
+        self.calls.append(kwargs["facets"])
+        return pd.DataFrame()
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        # A bare leading-zero code is not valid Python, so Fire used to pass
+        # the whole argument on as a string instead of a mapping.
+        (["--facets", "{generatorid: 01}"], {"generatorid": "01"}),
+        (["--facets", "{generatorid: [01, 02]}"], {"generatorid": ["01", "02"]}),
+        # An all-zero code used to become the int 0.
+        (["--facets", "{generatorid: 00}"], {"generatorid": "00"}),
+        # The --flag=value form.
+        (["--facets={generatorid: 01}"], {"generatorid": "01"}),
+        # Quoted values and plain numbers parse as before.
+        (['--facets={"generatorid": "01"}'], {"generatorid": "01"}),
+        (["--facets", "{sectorid: [1, 2]}"], {"sectorid": [1, 2]}),
+        (["--facets", "{stateid: CO, plantid: 3}"], {"stateid": "CO", "plantid": 3}),
+    ],
+)
+def test_cli_keeps_facet_codes_as_text(
+    command: list[str], expected: dict[str, object]
+) -> None:
+    """Facet codes keep their leading zeros, whichever way they are given."""
+    calls: list[object] = []
+    cli = eia_core._Cli.__new__(eia_core._Cli)
+    cli._eia = _Recorder(calls)  # type: ignore[assignment]
+    eia_core._keep_codes_as_text()
+    route = "electricity/operating-generator-capacity"
+    fire.Fire(cli, command=["get-data", route, *command])
+    # The flag before the positional route.
+    fire.Fire(cli, command=["get-data", *command, route])
+    assert calls == [expected, expected]
+
+
+def test_cli_keeps_positional_and_writer_facet_codes(tmp_path: Path) -> None:
+    """Positional facets and the writers' facets keep leading zeros too."""
+    calls: list[object] = []
+    cli = eia_core._Cli.__new__(eia_core._Cli)
+    cli._eia = _Recorder(calls)  # type: ignore[assignment]
+    eia_core._keep_codes_as_text()
+    route = "electricity/operating-generator-capacity"
+    # Positionally: route, data, facets.
+    fire.Fire(cli, command=["get-data", route, "nameplate", "{generatorid: 01}"])
+    out = str(tmp_path / "gen.csv")
+    fire.Fire(cli, command=["to-csv", out, route, "--facets", "{generatorid: 01}"])
+    fire.Fire(cli, command=["update-csv", out, route, "--facets={generatorid: 01}"])
+    assert calls == [{"generatorid": "01"}] * 3
+
+
+def test_every_command_with_facets_keeps_codes_as_text() -> None:
+    """Each command taking ``facets`` gets the leading-zero-safe parser."""
+    eia_core._keep_codes_as_text()
+    commands = [
+        "get_data",
+        "to_csv",
+        "to_excel",
+        "to_parquet",
+        "to_json",
+        "update_csv",
+    ]
+    for name in commands:
+        named = fire.decorators.GetParseFns(getattr(eia_core._Cli, name))["named"]
+        assert named == {"facets": eia_core._facets_literal}
+    assert not fire.decorators.GetParseFns(eia_core._Cli.facet_values)["named"]
+
+
+def test_main_keeps_facet_codes_as_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The console entry point applies the facet handling itself."""
+    calls: list[object] = []
+    monkeypatch.setattr(eia_core, "EIA", lambda: _Recorder(calls))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "eia-api",
+            "--log-level",
+            "WARNING",
+            "get-data",
+            "--facets",
+            "{generatorid: 01}",
+            "electricity/operating-generator-capacity",
+        ],
+    )
+    eia_core.main()
+    assert calls == [{"generatorid": "01"}]
+
+
 def test_cli_get_data_out_writes(cli: eia_core._Cli, tmp_path: Path) -> None:
     """get_data --out writes a CSV and reports the destination."""
     out = tmp_path / "cli.csv"

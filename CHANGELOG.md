@@ -32,11 +32,15 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- CLI `--facets` codes keep their leading zeros. python-fire reads the mapping as
+  a Python literal, so a bare code such as `'{generatorid: 01}'` made it give up
+  and pass the whole text on as a string (the command then failed), and
+  `'{generatorid: 00}'` became the int `0`. Bare leading-zero codes are now
+  read as text; quoted values and other numbers parse as before.
 - `update_csv`/`new_observations` compare row keys as text, so numeric-looking
   facet ids (`"01"`, `"3"`) survive the CSV round-trip instead of being treated
   as new rows, and a stored value that is still missing (NaN) no longer counts
   as new on every run.
-
 - CLI period bounds given as bare numbers (`--start 2024`, `--end 202406`) are
   passed to the client as text. python-fire had turned them into ints, which
   broke the `str | None` contract and gave the query a different cache entry
