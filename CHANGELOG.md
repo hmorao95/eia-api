@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - `--log-file` no longer gets ANSI color codes in tracebacks on Python 3.13+:
   the file handler re-renders tracebacks instead of reusing the console's
   colored copy.
+- The API key is now also masked in `urllib3.util.retry` records, which log the
+  full request URL when a connection error is retried or given up on.
 
 - The README, the installation docs and `CITATION.cff` no longer point to PyPI,
   where the package is not published: the PyPI badge and identifier are removed,

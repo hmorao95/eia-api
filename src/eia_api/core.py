@@ -128,7 +128,7 @@ class _RedactKeyFilter(logging.Filter):
     Remove registered API keys from log records.
 
     The key travels in the query string, and both HTTP clients log full URLs:
-    ``urllib3`` at DEBUG and ``httpx`` at INFO. This filter sits on those loggers
+    ``urllib3`` at DEBUG (requests and retries) and ``httpx`` at INFO. This filter sits on those loggers
     (and on the package logger, as a safety net) and rewrites any record that
     contains a key, replacing it with ``***``: any ``api_key=<value>`` query
     parameter is masked by pattern, and every registered key is masked wherever
@@ -164,7 +164,7 @@ class _RedactKeyFilter(logging.Filter):
 # One filter instance for the process; every key a client uses is registered on
 # it (see ``_register_secret``).
 _REDACT_FILTER = _RedactKeyFilter()
-for _name in ("urllib3.connectionpool", "httpx", "eia_api"):
+for _name in ("urllib3.connectionpool", "urllib3.util.retry", "httpx", "eia_api"):
     logging.getLogger(_name).addFilter(_REDACT_FILTER)
 
 

@@ -996,7 +996,9 @@ def test_cache_hit_is_logged(
     assert "Cache hit: electricity" in caplog.text
 
 
-@pytest.mark.parametrize("logger_name", ["urllib3.connectionpool", "httpx"])
+@pytest.mark.parametrize(
+    "logger_name", ["urllib3.connectionpool", "urllib3.util.retry", "httpx"]
+)
 def test_http_library_logs_are_redacted(
     logger_name: str, caplog: pytest.LogCaptureFixture
 ) -> None:
