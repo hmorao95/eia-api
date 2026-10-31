@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Added
 
+- Opt-in tidy output: `get_data(..., tidy=True)` (sync and async, the `to_*`
+  writers, `update_csv`/`new_observations`, and `--tidy` on the CLI's data
+  commands) returns exactly `date`, the facet ids as dimensions (plus
+  `<facet>_name` labels where the API sends them), `variable` (the measure id),
+  `value` (float64) and `unit` (from the `<measure>-units` column, `<NA>` when
+  absent), sorted by the dimensions then `date`. The default output is
+  unchanged.
+- Opt-in polars output: `get_data(..., as_polars=True)` (sync and async) returns
+  a `polars.DataFrame`, with `@overload`ed return types. polars is an optional
+  extra: `pip install "eia-api[polars]"`.
+
 - Logging: the library now logs to the `eia_api` logger (silent by default via a
   `NullHandler`). Requests, cache hits and expiries, throttle sleeps and each
   page are logged at DEBUG; a summary per fetch, export and incremental update
@@ -20,6 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   (which log full request URLs) and from the package logger.
 
 ### Fixed
+
+- `update_csv`/`new_observations` compare row keys as text, so numeric-looking
+  facet ids (`"01"`, `"3"`) survive the CSV round-trip instead of being treated
+  as new rows, and a stored value that is still missing (NaN) no longer counts
+  as new on every run.
 
 - CLI period bounds given as bare numbers (`--start 2024`, `--end 202406`) are
   passed to the client as text. python-fire had turned them into ints, which
