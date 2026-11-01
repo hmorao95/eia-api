@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- `pre-commit` is no longer a dev dependency: run the hooks with
+  `uvx pre-commit` (for example `uvx pre-commit install`). This drops
+  `virtualenv` and `filelock` from `uv.lock`; filelock has no patched release
+  for Python 3.10.
 - The manual Publish workflow's version check (tag = pyproject = CITATION) now runs
   when the workflow is started from a release tag; it was tied to release events,
   which no longer trigger the workflow.

@@ -507,8 +507,8 @@ uv run pytest
 commit:
 
 ```bash
-uv run pre-commit install       # one-time, enables the git hook
-uv run pre-commit run --all-files
+uvx pre-commit install       # one-time, enables the git hook
+uvx pre-commit run --all-files
 ```
 
 CI (`.github/workflows/ci.yml`) runs the same gate on every push and pull
