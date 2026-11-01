@@ -11,8 +11,8 @@ authors:
   - family-names: "Morão"
     given-names: "Hugo"
     email: "hfmorao@gmail.com"
-version: "0.2.0"
-date-released: "2026-10-19"
+version: "0.3.0"
+date-released: "2026-11-01"
 license: MIT
 repository-code: "https://github.com/hmorao95/eia-api"
 url: "https://github.com/hmorao95/eia-api"

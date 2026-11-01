@@ -1,6 +1,6 @@
 [project]
 name = "eia-api"
-version = "0.2.0"
+version = "0.3.0"
 description = "Python wrapper for the U.S. Energy Information Administration (EIA) API v2 (electricity, petroleum, natural gas, coal, renewables)."
 readme = "README.md"
 requires-python = ">=3.10"

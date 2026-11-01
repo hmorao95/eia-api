@@ -1,8 +1,7 @@
 name: Publish
 
+# Publishing is manual (no release trigger) because the package is not on PyPI.
 on:
-  release:
-    types: [published]
   workflow_dispatch:
 
 permissions:
