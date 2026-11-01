@@ -111,7 +111,7 @@ wrong for a case, add a narrowly-scoped ignore with a comment explaining why.
      citation line, and **`uv.lock`** (`uv lock`);
   3. commit, push, wait for CI;
   4. `git tag -a vX.Y.Z` and `gh release create vX.Y.Z`.
-- Publishing is automatic: a published GitHub release triggers
-  `.github/workflows/publish.yml` (uv build + `uv publish` via PyPI Trusted
-  Publishing, no token). The publish job re-checks that the tag, `pyproject` and
-  `CITATION` versions all agree before uploading.
+- Publishing is manual: a published GitHub release no longer publishes to PyPI
+  (the package is not on PyPI yet). Run the Publish workflow
+  (`.github/workflows/publish.yml`: uv build + `uv publish` via PyPI Trusted
+  Publishing, no token) by hand once a Trusted Publisher exists.

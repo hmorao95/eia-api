@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-01
+
 ### Added
 
 - CLI flag `--no-cache`, accepted before or after any command, to skip the
@@ -132,6 +134,7 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   interrogate (docstring coverage), codespell, pre-commit hooks, and GitHub
   Actions CI and publish workflows.
 
-[Unreleased]: https://github.com/hmorao95/eia-api/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/hmorao95/eia-api/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/hmorao95/eia-api/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/hmorao95/eia-api/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/hmorao95/eia-api/releases/tag/v0.1.0
