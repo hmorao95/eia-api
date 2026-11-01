@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Changed
+
+- The manual Publish workflow's version check (tag = pyproject = CITATION) now runs
+  when the workflow is started from a release tag; it was tied to release events,
+  which no longer trigger the workflow.
+
 ## [0.3.0] - 2026-11-01
 
 ### Added
