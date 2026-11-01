@@ -20,6 +20,11 @@ jobs:
       - name: Set up Python
         run: uv python install 3.10
 
+      - name: Allow access to wrapkit (private repository)
+        env:
+          WRAPKIT_TOKEN: ${{ secrets.WRAPKIT_TOKEN }}
+        run: git config --global url."https://x-access-token:${WRAPKIT_TOKEN}@github.com/hmorao95/wrapkit".insteadOf "https://github.com/hmorao95/wrapkit"
+
       - name: Install dependencies
         run: uv sync
 

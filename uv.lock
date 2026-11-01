@@ -580,14 +580,13 @@ version = "0.3.0"
 source = { editable = "." }
 default-groups = ["dev", "typing"]
 dependencies = [
-    { name = "colorlog" },
-    { name = "fire" },
     { name = "httpx" },
     { name = "openpyxl" },
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "pandas", version = "3.0.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pyarrow" },
     { name = "requests" },
+    { name = "wrapkit" },
 ]
 
 [package.optional-dependencies]
@@ -629,14 +628,13 @@ typing = [
 
 [package.metadata]
 requires-dist = [
-    { name = "colorlog", specifier = ">=6.8" },
-    { name = "fire", specifier = ">=0.6" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "openpyxl", specifier = ">=3.1" },
     { name = "pandas", specifier = ">=2.2" },
     { name = "polars", marker = "extra == 'polars'", specifier = ">=1.0" },
     { name = "pyarrow", specifier = ">=15.0" },
     { name = "requests", specifier = ">=2.28" },
+    { name = "wrapkit", git = "https://github.com/hmorao95/wrapkit?rev=v0.1.0" },
 ]
 provides-extras = ["polars"]
 
@@ -2499,4 +2497,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/52/5c/ba82fdd0da13ade01453fc08277a70abc79128101319549f55f2e13f8f83/virtualenv-21.7.9.tar.gz", hash = "sha256:a7e42d81d779dec8afd7dc4be71640fb959ea861bccfa5980cb4ad9f92e30675", size = 5348882, upload-time = "2026-09-09T01:03:27.752Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/85/fc/888c80b8da917bfc48a41887eca244f995d190bd3c01175727089fcaf27e/virtualenv-21.7.9-py3-none-any.whl", hash = "sha256:ba3b0bb41063c848d84d76a9fe3fb7711aaa0f2fe78708e8f3cd9714770e4eac", size = 5324667, upload-time = "2026-09-09T01:03:26.023Z" },
+]
+
+[[package]]
+name = "wrapkit"
+version = "0.1.0"
+source = { git = "https://github.com/hmorao95/wrapkit?rev=v0.1.0#fde2927d3ac7d8c46ef090e5f993e6c330856712" }
+dependencies = [
+    { name = "colorlog" },
+    { name = "fire" },
+    { name = "httpx" },
+    { name = "openpyxl" },
+    { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "pandas", version = "3.0.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "pyarrow" },
+    { name = "requests" },
 ]

@@ -57,15 +57,10 @@ from __future__ import (  # Enables modern (PEP 604 / postponed) annotations.
     annotations,
 )
 
-import asyncio  # Backs the async client's non-blocking throttle sleep.
-import enum  # Builds the DEFAULT_CACHE_DIR sentinel type.
-import hashlib  # Derives the on-disk cache filename from the request signature.
-import json  # Serialises the cache key and reads/writes cached JSON payloads.
-import logging  # Reports requests, cache hits and progress; redacts the key.
 import os  # Reads the EIA_API_KEY environment variable as a key fallback.
-import re  # Masks the api_key query parameter in logged URLs.
-import sys  # Writes clean CLI error messages to stderr.
-import time  # Compares a cached file's mtime against the freshness TTL.
+import re  # Recognises facet label columns (stateDescription, ...).
+import sys  # Reads the CLI's command-line arguments.
+import time  # Times each request for the debug log.
 from dataclasses import dataclass  # Builds the immutable Route value type.
 from pathlib import Path  # Cross-platform filesystem paths for the cache/outputs.
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, overload  # Typing helpers.
@@ -73,6 +68,40 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, overload  # Typing hel
 import httpx  # Async HTTP client backing :class:`AsyncEIA`.
 import pandas as pd  # The core tabular data type used throughout the module.
 import requests  # HTTP client for calling the EIA REST API.
+from wrapkit.cache import (  # Shared disk cache and its default sentinel.
+    DEFAULT_CACHE_DIR,
+    DefaultCacheDir,
+    DiskCache,
+    cache_path,
+    resolve_cache_dir,
+)
+from wrapkit.cli import (  # Shared python-fire helpers.
+    as_text,
+    bind_bool_flags,
+    literal_keeping_codes,
+    resolve_out,
+    run,
+    set_parse_fns,
+)
+from wrapkit.frames import (  # Shared tidy-shape helpers.
+    as_polars,
+    empty_tidy,
+    snake,
+    tidy_frame,
+)
+from wrapkit.http import AsyncThrottle, Throttle  # Request-rate throttles.
+from wrapkit.incremental import (  # Shared new/revised-row logic.
+    read_existing,
+    select_new,
+    upsert,
+)
+from wrapkit.io import write_frame  # Shared CSV/Excel/Parquet/JSON writer.
+from wrapkit.log import (  # Shared logging and key redaction.
+    RedactFilter,
+    configure_logging,
+    loggable,
+    package_logger,
+)
 
 if TYPE_CHECKING:
     # Imported only for type checking to keep the runtime import graph small;
@@ -83,7 +112,7 @@ if TYPE_CHECKING:
     import polars as pl
 
 # Only the public surface is exported; helpers and the CLI facade stay private.
-__all__ = ["EIA", "AsyncEIA", "Route"]
+__all__ = ["DEFAULT_CACHE_DIR", "EIA", "AsyncEIA", "Route"]
 
 # Root of the versioned API. Every route path is appended to this base, and the
 # metadata endpoint for a route is the route itself while its rows live under an
@@ -105,71 +134,23 @@ _USER_AGENT = (
     "Mozilla/5.0 (compatible; eia-api-wrapper/1.0; +https://www.eia.gov/opendata/)"
 )
 
-# The package logger. As a library it only emits records; the NullHandler keeps
-# them silent until an application (or the CLI, see ``_configure_logging``)
-# attaches a handler, e.g. ``logging.getLogger("eia_api").setLevel("DEBUG")``.
-_log = logging.getLogger("eia_api")
-_log.addHandler(logging.NullHandler())
-
-# Levels accepted by the CLI's ``--log-level`` flag.
-_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+# The package logger. As a library it only emits records; nothing is printed
+# until an application (or the CLI, see ``_configure_logging``) attaches a
+# handler, e.g. ``logging.getLogger("eia_api").setLevel("DEBUG")``.
+_log = package_logger("eia_api")
 
 # Marks the handlers the CLI installs, so reconfiguring replaces them instead of
 # stacking duplicates.
 _CLI_HANDLER_FLAG = "_eia_api_cli_handler"
 
-# Matches the key's query parameter in a logged URL; group 1 keeps the name.
-_KEY_PARAM = re.compile(r"(api_key=)[^&\s\"']+")
+# The key travels in the query string, and both HTTP clients log full URLs
+# (urllib3 at DEBUG, httpx at INFO). One filter for the process masks any
+# ``api_key=<value>`` and every key a client uses (see ``_register_secret``) on
+# those loggers and on the package logger. Records are never dropped.
+_REDACT_FILTER = RedactFilter(["api_key"]).install("eia_api")
 
-# Keys shorter than this are not registered for plain-text masking: replacing a
-# tiny string everywhere would mangle unrelated text. Real EIA keys are 40
-# characters, and the pattern above still masks short keys inside URLs.
-_MIN_SECRET_LENGTH = 8
-
-
-class _RedactKeyFilter(logging.Filter):
-    """
-    Remove registered API keys from log records.
-
-    The key travels in the query string, and both HTTP clients log full URLs:
-    ``urllib3`` at DEBUG (requests and retries) and ``httpx`` at INFO. This filter sits on those loggers
-    (and on the package logger, as a safety net) and rewrites any record that
-    contains a key, replacing it with ``***``: any ``api_key=<value>`` query
-    parameter is masked by pattern, and every registered key is masked wherever
-    it appears. Records are never dropped, so applications keep their HTTP
-    logs, minus the secret.
-    """
-
-    def __init__(self) -> None:
-        """Start with no registered keys."""
-        super().__init__()
-        self.secrets: set[str] = set()
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        """
-        Redact registered keys from a record's message.
-
-        Args:
-            record (logging.LogRecord): The record about to be emitted.
-
-        Returns:
-            bool: Always ``True``: the record is kept, only its text changes.
-        """
-        message = record.getMessage()
-        cleaned = _KEY_PARAM.sub(r"\1***", message)
-        for secret in self.secrets:
-            cleaned = cleaned.replace(secret, "***")
-        if cleaned != message:
-            # Freeze the cleaned text so later formatting cannot re-insert it.
-            record.msg, record.args = cleaned, ()
-        return True
-
-
-# One filter instance for the process; every key a client uses is registered on
-# it (see ``_register_secret``).
-_REDACT_FILTER = _RedactKeyFilter()
-for _name in ("urllib3.connectionpool", "urllib3.util.retry", "httpx", "eia_api"):
-    logging.getLogger(_name).addFilter(_REDACT_FILTER)
+# The type of :data:`DEFAULT_CACHE_DIR`, under its earlier private name.
+_DefaultCacheDir = DefaultCacheDir
 
 
 def _register_secret(api_key: str | None) -> None:
@@ -178,10 +159,10 @@ def _register_secret(api_key: str | None) -> None:
 
     Args:
         api_key (str | None): The key to scrub from logs; ``None`` or a key
-            shorter than ``_MIN_SECRET_LENGTH`` is ignored.
+            shorter than eight characters is ignored (the URL pattern still
+            masks it).
     """
-    if api_key and len(api_key) >= _MIN_SECRET_LENGTH:
-        _REDACT_FILTER.secrets.add(api_key)
+    _REDACT_FILTER.register(api_key)
 
 
 def _loggable(params: Sequence[tuple[str, str]]) -> str:
@@ -195,59 +176,25 @@ def _loggable(params: Sequence[tuple[str, str]]) -> str:
     Returns:
         str: ``name=value`` pairs joined by ``&``, with ``api_key`` left out.
     """
-    return "&".join(f"{k}={v}" for k, v in params if k != "api_key")
+    return loggable(params, ["api_key"])
 
 
-class _DefaultCacheDir(enum.Enum):
-    """
-    Type of :data:`DEFAULT_CACHE_DIR`, the "use the default cache" marker.
-
-    A one-member enum rather than a ready-made path, so that the default
-    directory (``~/.cache/eia_api``) is resolved when a client is constructed, not
-    when the module is imported: a changed home directory (or a test patching
-    :meth:`pathlib.Path.home`) is honoured. Being an enum member, it is a
-    distinct value that type checkers can narrow on, and it can never be
-    confused with ``None``, which means "no on-disk cache".
-    """
-
-    DEFAULT_CACHE_DIR = "DEFAULT_CACHE_DIR"
-
-    def __repr__(self) -> str:
-        """
-        Return the public name, so signatures read ``cache_dir=DEFAULT_CACHE_DIR``.
-
-        Returns:
-            str: The literal ``"DEFAULT_CACHE_DIR"``.
-        """
-        return "DEFAULT_CACHE_DIR"
-
-
-#: Default value of every ``cache_dir`` argument: cache responses in
-#: ``~/.cache/eia_api`` (the home directory is looked up when the client is
-#: built). Pass ``cache_dir=None`` (or ``""``) instead to disable the on-disk
-#: cache, or any path to use that directory.
-DEFAULT_CACHE_DIR = _DefaultCacheDir.DEFAULT_CACHE_DIR
-
-
-def _resolve_cache_dir(cache_dir: str | Path | _DefaultCacheDir | None) -> Path | None:
+def _resolve_cache_dir(cache_dir: str | Path | DefaultCacheDir | None) -> Path | None:
     """
     Turn a ``cache_dir`` argument into the cache directory to use, if any.
 
     :data:`DEFAULT_CACHE_DIR` maps to ``~/.cache/eia_api`` under the *current*
     home directory; ``None`` and any other falsy value (such as ``""``) disable
-    the on-disk cache; anything else is taken as the directory path. Nothing is
-    created here; the clients create the directory themselves.
+    the on-disk cache; anything else is taken as the directory path.
 
     Args:
-        cache_dir (str | Path | _DefaultCacheDir | None): The value passed to a
+        cache_dir (str | Path | DefaultCacheDir | None): The value passed to a
             client constructor.
 
     Returns:
         Path | None: The cache directory, or ``None`` when caching is off.
     """
-    if isinstance(cache_dir, _DefaultCacheDir):
-        return Path.home() / ".cache" / "eia_api"
-    return Path(cache_dir) if cache_dir else None
+    return resolve_cache_dir(cache_dir, "eia_api")
 
 
 def _cache_path(
@@ -256,10 +203,9 @@ def _cache_path(
     """
     Return the on-disk cache path for a request, or ``None`` when disabled.
 
-    Shared by the sync and async clients so both derive an identical filename.
-    The name is a SHA-256 digest of the endpoint plus the request parameters with
-    the API key stripped out, so the secret never influences (or leaks into) the
-    cache key and two callers with different keys share the same cached payload.
+    The name is a SHA-256 digest of the endpoint plus the request parameters
+    with the API key left out, so the secret never reaches a file name and two
+    callers with different keys share one cached payload.
 
     Args:
         cache_dir (Path | None): Cache directory, or ``None`` if caching is off.
@@ -270,14 +216,24 @@ def _cache_path(
     Returns:
         Path | None: The cache file path, or ``None`` if caching is disabled.
     """
-    if not cache_dir:
-        return None
-    # Exclude the api_key so the digest is stable across keys and the secret is
-    # never part of a filename; sort for order-independence.
-    signature = sorted((k, v) for k, v in params if k != "api_key")
-    blob = json.dumps([endpoint, signature], separators=(",", ":"))
-    digest = hashlib.sha256(blob.encode("utf-8")).hexdigest()
-    return cache_dir / f"{digest}.json"
+    return cache_path(cache_dir, endpoint, params, hidden=["api_key"])
+
+
+def _disk_cache(cache_dir: Path | None, ttl_seconds: float) -> DiskCache:
+    """
+    Return the response cache for a client's current settings.
+
+    Built per request from the client's ``cache_dir`` and
+    ``cache_ttl_seconds``, so changing either attribute takes effect at once.
+
+    Args:
+        cache_dir (Path | None): Cache directory, or ``None`` if caching is off.
+        ttl_seconds (float): Freshness window in seconds.
+
+    Returns:
+        DiskCache: The cache (never hits when ``cache_dir`` is ``None``).
+    """
+    return DiskCache(cache_dir, ttl_seconds, hidden=["api_key"], logger=_log)
 
 
 def _routes_frame(meta: Mapping[str, Any]) -> pd.DataFrame:
@@ -484,22 +440,7 @@ _LABEL_COLUMN = re.compile(r"(description|name)$", re.IGNORECASE)
 _TIDY_VALUE_COLUMNS = ("value", "unit")
 
 
-def _snake(name: str) -> str:
-    """
-    Convert an API column name to snake_case.
-
-    Splits camelCase boundaries and turns any run of non-alphanumeric characters
-    (hyphens, spaces) into a single underscore, so ``stateDescription`` becomes
-    ``state_description`` and ``area-name`` becomes ``area_name``.
-
-    Args:
-        name (str): The raw column name.
-
-    Returns:
-        str: The lower-case snake_case name.
-    """
-    spaced = re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name)
-    return re.sub(r"[^0-9A-Za-z]+", "_", spaced).strip("_").lower()
+_snake = snake
 
 
 def _dimension_map(frame: pd.DataFrame, columns: Sequence[str]) -> dict[str, str]:
@@ -560,14 +501,7 @@ def _to_tidy(frame: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
     measures = [c for c in columns if c in frame.columns]
     if frame.empty or not measures:
         # Nothing to melt: return the empty tidy shape with its dtypes.
-        return pd.DataFrame(
-            {
-                "date": pd.Series(dtype="datetime64[ns]"),
-                **{c: pd.Series(dtype="string") for c in dim_cols},
-                "value": pd.Series(dtype="float64"),
-                "unit": pd.Series(dtype="string"),
-            }
-        )
+        return empty_tidy(dim_cols)
     dates = (
         frame["date"]
         if "date" in frame.columns
@@ -587,18 +521,8 @@ def _to_tidy(frame: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
         )
         part["unit"] = frame[unit_col] if unit_col else None
         pieces.append(part)
-    tidy = pd.concat(pieces, ignore_index=True)
-    tidy["date"] = pd.to_datetime(tidy["date"]).astype("datetime64[ns]")
-    for col in dim_cols:
-        tidy[col] = tidy[col].astype("string")
-    tidy["value"] = tidy["value"].astype("float64")
-    # A blank unit string carries no information, so treat it as missing.
-    tidy["unit"] = tidy["unit"].astype("string").replace("", pd.NA)
-    return (
-        tidy[["date", *dim_cols, *_TIDY_VALUE_COLUMNS]]
-        .sort_values([*dim_cols, "date"], kind="stable")
-        .reset_index(drop=True)
-    )
+    # Shared column order, dtypes (blank units become <NA>) and sort.
+    return tidy_frame(pd.concat(pieces, ignore_index=True), dim_cols)
 
 
 def _as_polars(frame: pd.DataFrame) -> pl.DataFrame:
@@ -606,23 +530,16 @@ def _as_polars(frame: pd.DataFrame) -> pl.DataFrame:
     Convert a pandas result to a polars DataFrame, importing polars lazily.
 
     polars is an optional extra, so it is only imported when a caller asks for
-    ``as_polars=True``.
+    ``as_polars=True``; without it, the ``ImportError`` names the ``polars``
+    extra to install.
 
     Args:
         frame (pd.DataFrame): The pandas result to convert.
 
     Returns:
         pl.DataFrame: ``polars.from_pandas(frame)``.
-
-    Raises:
-        ImportError: If polars is not installed.
     """
-    try:
-        import polars as pl
-    except ImportError as exc:
-        msg = 'polars is not installed; install it with pip install "eia-api[polars]"'
-        raise ImportError(msg) from exc
-    return pl.from_pandas(frame)
+    return as_polars(frame, "eia-api")
 
 
 def _finish(
@@ -645,32 +562,6 @@ def _finish(
     if tidy:
         frame = _to_tidy(frame, columns)
     return _as_polars(frame) if as_polars else frame
-
-
-def _key_strings(frame: pd.DataFrame, key_cols: Sequence[str]) -> pd.DataFrame:
-    """
-    Render a frame's key columns as comparable strings.
-
-    A CSV round-trip changes dtypes (a numeric-looking facet id comes back as an
-    int, a date as text), so both sides of a key comparison are cast to strings
-    first. ``date`` is normalised to one ISO format and missing values to ``""``.
-
-    Args:
-        frame (pd.DataFrame): A fetched or stored frame.
-        key_cols (Sequence[str]): The identifying columns.
-
-    Returns:
-        pd.DataFrame: The key columns as plain strings, same index as ``frame``.
-    """
-    out = pd.DataFrame(index=frame.index)
-    for col in key_cols:
-        series = frame[col]
-        if col == "date":
-            series = pd.to_datetime(series, format="ISO8601").dt.strftime(
-                "%Y-%m-%dT%H:%M:%S"
-            )
-        out[col] = series.astype("string").fillna("").astype(str)
-    return out
 
 
 @dataclass(frozen=True)
@@ -806,14 +697,9 @@ class EIA:
             session.headers["User-Agent"] = _USER_AGENT
         self.session = session
 
-        # Client-side throttle: keep at least this many seconds between network
-        # requests (0.0 disables). ``_last_request_monotonic`` starts at 0.0 so
-        # the very first request never waits (the elapsed gap is effectively
-        # infinite against a fresh monotonic clock).
-        self._min_request_interval = (
-            1.0 / requests_per_second if requests_per_second else 0.0
-        )
-        self._last_request_monotonic = 0.0
+        # Client-side throttle between network requests (never for cache hits);
+        # the first request never waits.
+        self._throttler = Throttle(requests_per_second, _log)
 
         # In-memory memoisation of route metadata so repeated lookups (e.g. the
         # automatic data-column discovery in ``get_data``) are free per process.
@@ -872,15 +758,7 @@ class EIA:
         time elapsed since the previous network request, then records the new
         request time. A no-op when throttling is disabled.
         """
-        if not self._min_request_interval:
-            return
-        wait = self._min_request_interval - (
-            time.monotonic() - self._last_request_monotonic
-        )
-        if wait > 0:
-            _log.debug("Throttling: sleeping %.3fs", wait)
-            time.sleep(wait)
-        self._last_request_monotonic = time.monotonic()
+        self._throttler.wait()
 
     def _request(
         self, endpoint: str, params: Sequence[tuple[str, str]]
@@ -906,16 +784,12 @@ class EIA:
         Raises:
             RuntimeError: If the API returns an ``error`` field.
         """
-        cache_file = self._cache_path(endpoint, params)
+        cache = _disk_cache(self.cache_dir, self.cache_ttl_seconds)
         # Reuse the cached copy while it is still within its freshness window.
-        if cache_file and cache_file.exists():
-            age = time.time() - cache_file.stat().st_mtime
-            if age < self.cache_ttl_seconds:
-                _log.debug("Cache hit: %s (age %.0fs)", endpoint, age)
-                cached = json.loads(cache_file.read_text("utf-8"))
-                cached_response: dict[str, Any] = cached["response"]
-                return cached_response
-            _log.debug("Cache expired: %s (age %.0fs)", endpoint, age)
+        hit, cached = cache.get(endpoint, params)
+        if hit:
+            cached_response: dict[str, Any] = cached["response"]
+            return cached_response
 
         # Only real network requests are throttled; cache hits returned above.
         self._throttle()
@@ -938,8 +812,7 @@ class EIA:
             raise RuntimeError(msg)
         resp.raise_for_status()
 
-        if cache_file:
-            cache_file.write_text(json.dumps(payload), encoding="utf-8")
+        cache.put(endpoint, params, payload)
         response: dict[str, Any] = payload["response"]
         return response
 
@@ -1431,8 +1304,7 @@ class EIA:
             Path: The path that was written.
         """
         frame = self.get_data(**kwargs)
-        path = Path(path)
-        frame.to_csv(path, index=False)
+        path = write_frame(frame, path, "csv")
         _log.info("Wrote %d rows to %s", len(frame), path)
         return path
 
@@ -1458,7 +1330,7 @@ class EIA:
         # dates to plain ``date`` objects so Excel shows just the day.
         if "date" in frame.columns:
             frame["date"] = pd.to_datetime(frame["date"]).dt.date
-        frame.to_excel(path, index=False, sheet_name="data")
+        write_frame(frame, path, "excel")
         _log.info("Wrote %d rows to %s", len(frame), path)
         return path
 
@@ -1478,8 +1350,7 @@ class EIA:
             Path: The path that was written.
         """
         frame = self.get_data(**kwargs)
-        path = Path(path)
-        frame.to_parquet(path, index=False)
+        path = write_frame(frame, path, "parquet")
         _log.info("Wrote %d rows to %s", len(frame), path)
         return path
 
@@ -1498,8 +1369,7 @@ class EIA:
             Path: The path that was written.
         """
         frame = self.get_data(**kwargs)
-        path = Path(path)
-        frame.to_json(path, orient="records", date_format="iso", indent=2)
+        path = write_frame(frame, path, "json")
         _log.info("Wrote %d rows to %s", len(frame), path)
         return path
 
@@ -1554,64 +1424,6 @@ class EIA:
             return keys, ["value"]
         return cls._key_columns(frame, value_cols), value_cols
 
-    @staticmethod
-    def _select_new(
-        fresh: pd.DataFrame,
-        existing: pd.DataFrame,
-        key_cols: list[str],
-        value_cols: list[str],
-        *,
-        include_revisions: bool = True,
-    ) -> pd.DataFrame:
-        """
-        Return the rows of ``fresh`` that are new (or revised) versus ``existing``.
-
-        A fresh row is selected when its key is absent from ``existing`` (a
-        brand-new period, or a facet combination never extracted before). When
-        ``include_revisions`` is true, rows whose key already exists but whose
-        value columns differ (an EIA back-revision) are also selected; two
-        missing values count as equal. Keys are compared as strings, so a CSV
-        round-trip that changed their dtypes does not defeat the match.
-
-        Args:
-            fresh (pd.DataFrame): A freshly fetched long DataFrame.
-            existing (pd.DataFrame): The previously saved long DataFrame.
-            key_cols (list[str]): The identifying columns.
-            value_cols (list[str]): The value columns compared for revisions.
-            include_revisions (bool): Also select rows whose stored value has
-                changed, not just entirely new keys.
-
-        Returns:
-            pd.DataFrame: The subset of ``fresh`` to add or upsert, preserving
-            ``fresh``'s column order.
-        """
-        # With no prior history every fresh row is, by definition, new.
-        if existing.empty:
-            return fresh
-
-        # Left-join each fresh row (by its string key) to the stored values; the
-        # merge indicator flags keys that were never stored.
-        prior_cols = [c for c in value_cols if c in existing.columns]
-        renamed = {c: f"_prev_{c}" for c in prior_cols}
-        left = _key_strings(fresh, key_cols)
-        for col in prior_cols:
-            left[col] = fresh[col]
-        prior = (
-            _key_strings(existing, key_cols)
-            .join(existing[prior_cols].rename(columns=renamed))
-            .drop_duplicates(subset=key_cols, keep="last")
-        )
-        merged = left.merge(prior, on=key_cols, how="left", indicator=True)
-        selected = merged["_merge"] == "left_only"
-        if include_revisions:
-            # A stored row is revised when any measure differs (NaN == NaN).
-            for col in prior_cols:
-                now, prev = merged[col], merged[f"_prev_{col}"]
-                same = (now == prev) | (now.isna() & prev.isna())
-                selected |= (merged["_merge"] == "both") & ~same
-        # Index back into ``fresh`` (via a positional mask) to keep its columns.
-        return fresh[selected.to_numpy()].reset_index(drop=True)
-
     def new_observations(
         self,
         existing: pd.DataFrame | str | Path,
@@ -1657,8 +1469,10 @@ class EIA:
         key_cols, compare_cols = self._row_key(
             fresh, value_cols, tidy=bool(kwargs.get("tidy"))
         )
-        existing_frame = self._coerce_frame(existing, fresh, compare_cols)
-        new = self._select_new(
+        existing_frame = read_existing(
+            existing, fresh, compare_cols, text_cols=["period"]
+        )
+        new = select_new(
             fresh,
             existing_frame,
             key_cols,
@@ -1669,44 +1483,6 @@ class EIA:
             "%s: %d new/revised rows versus the existing extract", route, len(new)
         )
         return new
-
-    @staticmethod
-    def _coerce_frame(
-        existing: pd.DataFrame | str | Path,
-        fresh: pd.DataFrame,
-        value_cols: Sequence[str] = (),
-    ) -> pd.DataFrame:
-        """
-        Normalise an "already extracted" source into a comparable DataFrame.
-
-        Accepts either an in-memory frame (copied so the caller is not mutated) or
-        a path to a previously written CSV. A CSV is read as text, so key columns
-        keep their exact spelling (``"01"`` stays ``"01"``), and the value columns
-        are then parsed back into numbers.
-
-        Args:
-            existing (pd.DataFrame | str | Path): The prior extract or a CSV path.
-            fresh (pd.DataFrame): The freshly fetched frame (used for its shape).
-            value_cols (Sequence[str]): Numeric value columns to parse after
-                reading a CSV.
-
-        Returns:
-            pd.DataFrame: A comparable copy of the prior extract; an empty frame
-            (matching ``fresh``'s columns) when the source is empty.
-        """
-        if isinstance(existing, (str, Path)):
-            path = Path(existing)
-            if not path.exists():
-                return fresh.iloc[0:0]
-            frame = pd.read_csv(path, dtype=str)
-            for col in value_cols:
-                if col in frame.columns:
-                    frame[col] = pd.to_numeric(frame[col], errors="coerce")
-        else:
-            frame = existing.copy()
-        if "period" in frame.columns:
-            frame["period"] = frame["period"].astype(str)
-        return frame
 
     def update_csv(
         self,
@@ -1754,30 +1530,21 @@ class EIA:
             return fresh
 
         key_cols, compare_cols = self._row_key(fresh, value_cols, tidy=tidy)
-        existing = self._coerce_frame(path, fresh, compare_cols)
-        changed = self._select_new(fresh, existing, key_cols, compare_cols)
+        existing = read_existing(path, fresh, compare_cols, text_cols=["period"])
+        changed = select_new(fresh, existing, key_cols, compare_cols)
         if changed.empty:
             # Already up to date; leave the file untouched.
             _log.info("%s is already up to date", path)
             return changed
 
-        # Upsert: concatenate old and fresh, then keep the fresh row wherever a
-        # (string) key collides, so revised values overwrite stale ones while
-        # history absent from ``fresh`` is retained.
-        combined = pd.concat([existing, fresh], ignore_index=True)
-        keys = _key_strings(combined, key_cols)
-        combined = combined[~keys.duplicated(keep="last").to_numpy()]
-        if "date" in combined.columns:
-            # Stored dates are text and fresh ones Timestamps; unify the column
-            # so the file keeps one date format.
-            combined["date"] = pd.to_datetime(combined["date"], format="ISO8601")
-        # The default shape sorts by its key (period first); the tidy shape by
-        # its dimensions, then date.
+        # Upsert: the fresh row wins wherever a (string) key collides, so revised
+        # values overwrite stale ones while history absent from ``fresh`` is
+        # kept. The default shape sorts by its key (period first); the tidy shape
+        # by its dimensions, then date.
         sort_cols = (
             [*(c for c in key_cols if c != "date"), "date"] if tidy else key_cols
         )
-        order = _key_strings(combined, sort_cols).sort_values(sort_cols).index
-        combined = combined.loc[order].reset_index(drop=True)
+        combined = upsert(existing, fresh, key_cols, sort_cols)
         combined.to_csv(path, index=False)
         _log.info(
             "Upserted %d new/revised rows into %s (%d rows total)",
@@ -1855,10 +1622,7 @@ class AsyncEIA:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.cache_ttl_seconds = cache_ttl_hours * 3600.0
         self.timeout = timeout
-        self._min_request_interval = (
-            1.0 / requests_per_second if requests_per_second else 0.0
-        )
-        self._last_request_monotonic = 0.0
+        self._throttler = AsyncThrottle(requests_per_second, _log)
         # A caller-supplied client is never closed by us; a lazily-created one is.
         self._client = client
         self._owns_client = client is None
@@ -1913,15 +1677,7 @@ class AsyncEIA:
         Mirrors :meth:`EIA._throttle` but yields to the event loop instead of
         blocking it, so concurrent tasks share the rate budget cooperatively.
         """
-        if not self._min_request_interval:
-            return
-        wait = self._min_request_interval - (
-            time.monotonic() - self._last_request_monotonic
-        )
-        if wait > 0:
-            _log.debug("Throttling: sleeping %.3fs", wait)
-            await asyncio.sleep(wait)
-        self._last_request_monotonic = time.monotonic()
+        await self._throttler.await_turn()
 
     async def _request(
         self, endpoint: str, params: Sequence[tuple[str, str]]
@@ -1946,15 +1702,11 @@ class AsyncEIA:
         Raises:
             RuntimeError: If the API returns an ``error`` field.
         """
-        cache_file = _cache_path(self.cache_dir, endpoint, params)
-        if cache_file and cache_file.exists():
-            age = time.time() - cache_file.stat().st_mtime
-            if age < self.cache_ttl_seconds:
-                _log.debug("Cache hit: %s (age %.0fs)", endpoint, age)
-                cached = json.loads(cache_file.read_text("utf-8"))
-                cached_response: dict[str, Any] = cached["response"]
-                return cached_response
-            _log.debug("Cache expired: %s (age %.0fs)", endpoint, age)
+        cache = _disk_cache(self.cache_dir, self.cache_ttl_seconds)
+        hit, cached = cache.get(endpoint, params)
+        if hit:
+            cached_response: dict[str, Any] = cached["response"]
+            return cached_response
 
         # Only real network requests are throttled; cache hits returned above.
         await self._throttle()
@@ -1978,8 +1730,7 @@ class AsyncEIA:
             raise RuntimeError(msg)
         resp.raise_for_status()
 
-        if cache_file:
-            cache_file.write_text(json.dumps(payload), encoding="utf-8")
+        cache.put(endpoint, params, payload)
         response: dict[str, Any] = payload["response"]
         return response
 
@@ -2243,118 +1994,28 @@ EIA.AsyncAPI = AsyncEIA
 # ---------------------------------------------------------------------- #
 # CLI
 # ---------------------------------------------------------------------- #
-class _PlainFormatter(logging.Formatter):
-    """
-    A file formatter that always renders tracebacks without color.
-
-    ``logging`` caches a record's formatted traceback in ``exc_text`` for the
-    next handler. The colored console formatter (on Python 3.13+) renders it
-    with ANSI color codes, which would then leak into the log file; this
-    formatter ignores the cache and formats the traceback itself.
-    """
-
-    def format(self, record: logging.LogRecord) -> str:
-        """
-        Format a record, re-rendering any traceback as plain text.
-
-        Args:
-            record (logging.LogRecord): The record to format.
-
-        Returns:
-            str: The formatted line(s).
-        """
-        cached, record.exc_text = record.exc_text, None
-        try:
-            return super().format(record)
-        finally:
-            record.exc_text = cached
-
-
 def _configure_logging(level: str = "WARNING", log_file: str | None = None) -> None:
     """
     Attach the CLI's console (and optional file) handlers to the package logger.
 
     Only the command line calls this; the library itself never configures
     logging. The console handler writes colored records to stderr, so stdout
-    keeps only the command's output and can still be piped. The file handler,
-    when requested, appends every record down to DEBUG with full timestamps,
-    whatever the console level. Calling it again replaces the handlers it added
-    earlier rather than stacking duplicates.
+    keeps only the command's output; the file handler, when requested, appends
+    every record down to DEBUG as plain text. Calling it again replaces the
+    handlers it added earlier rather than stacking duplicates.
 
     Args:
         level (str): Console threshold, one of ``DEBUG``, ``INFO``, ``WARNING``
             or ``ERROR`` (case-insensitive).
         log_file (str | None): Path of a log file to append to, or ``None`` for
             console logging only.
-
-    Raises:
-        ValueError: If ``level`` is not one of the accepted names.
     """
-    # Imported lazily, like fire: only the CLI needs colored output.
-    import colorlog
-
-    name = level.upper()
-    if name not in _LOG_LEVELS:
-        msg = f"log_level must be one of {', '.join(_LOG_LEVELS)}, got {level!r}."
-        raise ValueError(msg)
-    console_level = getattr(logging, name)
-
-    # Drop the handlers a previous call installed, keep anything else.
-    for handler in list(_log.handlers):
-        if getattr(handler, _CLI_HANDLER_FLAG, False):
-            _log.removeHandler(handler)
-            handler.close()
-
-    console = colorlog.StreamHandler(sys.stderr)
-    console.setLevel(console_level)
-    console.setFormatter(
-        colorlog.ColoredFormatter(
-            "%(log_color)s%(asctime)s - %(levelname)s%(reset)s %(message)s",
-            datefmt="%H:%M:%S",
-            log_colors={
-                "DEBUG": "cyan",
-                "INFO": "green",
-                "WARNING": "yellow",
-                "ERROR": "red",
-                "CRITICAL": "red,bg_white",
-            },
-        )
-    )
-    handlers: list[logging.Handler] = [console]
-
-    if log_file:
-        file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(
-            _PlainFormatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-        )
-        handlers.append(file_handler)
-
-    for handler in handlers:
-        setattr(handler, _CLI_HANDLER_FLAG, True)
-        _log.addHandler(handler)
-    # The logger must pass the most verbose level any handler wants.
-    _log.setLevel(logging.DEBUG if log_file else console_level)
+    configure_logging(_log, level, log_file, flag=_CLI_HANDLER_FLAG)
 
 
-def _as_text(value: object) -> str | None:
-    """
-    Pass a CLI period bound through as text.
-
-    python-fire parses arguments that look like numbers, so ``--start 2024``
-    arrives as the int ``2024`` and ``--end 202406`` as ``202406``. Turning them
-    back into strings keeps the client's ``str | None`` contract and gives the
-    same query, and the same cache entry, as the library call
-    ``start="2024"``.
-
-    Args:
-        value (object): The value Fire passed, or ``None`` when the flag was
-            not given.
-
-    Returns:
-        str | None: ``None`` unchanged, anything else as ``str(value)``.
-    """
-    return None if value is None else str(value)
+# Fire parses number-like arguments (``--start 2024`` arrives as an int); the
+# CLI passes period bounds through as text.
+_as_text = as_text
 
 
 class _Cli:
@@ -2461,22 +2122,14 @@ class _Cli:
         """
         Route a bare filename into the ``outputs/`` folder.
 
-        A path with no directory part (e.g. ``data.csv``) is written under
-        ``outputs/`` (created if needed); a path that already has a directory,
-        relative or absolute, is returned unchanged.
-
         Args:
             path (str): The user-supplied destination path.
 
         Returns:
-            str: The resolved path to write to.
+            str: ``outputs/<name>`` for a bare name (the folder is created),
+            otherwise ``path`` unchanged.
         """
-        candidate = Path(path)
-        if candidate.parent == Path():
-            outputs = Path("outputs")
-            outputs.mkdir(exist_ok=True)
-            return str(outputs / candidate.name)
-        return path
+        return resolve_out(path)
 
     def get_data(
         self,
@@ -2779,37 +2432,9 @@ class _Cli:
         return f"Wrote {len(changed):,} new/revised rows -> {path}"
 
 
-#: A quoted string literal (group 1, left alone) or a bare word that starts with
-#: a zero followed by a digit (group 2), such as the generator id ``01``.
-_LEADING_ZERO_WORD = re.compile(
-    r"""("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')|(?<![\w.])(0\d[\w.]*)"""
-)
-
-
-def _facets_literal(value: str) -> object:
-    """
-    Parse a ``--facets`` argument, keeping leading-zero codes as text.
-
-    This is the python-fire parse function for ``facets``. Fire reads the
-    argument as a Python literal with bare words allowed (``{stateid: CO}``),
-    but a bare code with a leading zero breaks that: ``{generatorid: 01}`` is
-    not valid Python, so Fire gave up and passed the whole text on as a string,
-    and ``{generatorid: 00}`` became the int ``0``. Such words are quoted first,
-    so they arrive as ``"01"`` and ``"00"``. Quoted values and other numbers
-    (``{sectorid: [1, 2]}``) parse as before.
-
-    Args:
-        value (str): The argument's raw command-line text.
-
-    Returns:
-        object: The parsed value, normally a facet mapping.
-    """
-    from fire import parser  # Imported lazily so the library does not load Fire.
-
-    quoted = _LEADING_ZERO_WORD.sub(
-        lambda match: match.group(1) or repr(match.group(2)), value
-    )
-    return parser.DefaultParseValue(quoted)
+# Parses ``--facets``, keeping leading-zero codes such as ``{generatorid: 01}``
+# as text (Fire would otherwise give up on the literal or turn ``00`` into 0).
+_facets_literal = literal_keeping_codes
 
 
 #: CLI parameters that carry codes, and the parse function that keeps them.
@@ -2821,22 +2446,10 @@ def _keep_codes_as_text() -> None:
     Make the CLI keep the leading zeros of facet codes.
 
     Registers the parse functions in :data:`_CODE_PARSERS` with python-fire on
-    every :class:`_Cli` command that takes such a parameter, however the value
-    is given: ``--facets VALUE``, ``--facets=VALUE`` or positionally. Fire stores
-    the setting on the method itself, so calling this again is harmless.
-    :func:`main` calls it; tests that drive Fire directly call it too.
+    every :class:`_Cli` command that takes such a parameter. Calling it again is
+    harmless. :func:`main` calls it; tests that drive Fire directly call it too.
     """
-    import inspect  # Finds the commands that take a code parameter.
-
-    import fire  # Imported lazily so the library does not load Fire.
-
-    for name in dir(_Cli):
-        command = getattr(_Cli, name)
-        if name.startswith("_") or not inspect.isfunction(command):
-            continue
-        params = inspect.signature(command).parameters
-        if parsers := {k: fn for k, fn in _CODE_PARSERS.items() if k in params}:
-            fire.decorators.SetParseFns(**parsers)(command)
+    set_parse_fns(_Cli, _CODE_PARSERS)
 
 
 def _bind_no_cache_flag(argv: list[str]) -> list[str]:
@@ -2844,11 +2457,8 @@ def _bind_no_cache_flag(argv: list[str]) -> list[str]:
     Pin a bare ``--no-cache`` to ``True`` wherever it appears on the command line.
 
     Fire lets a bare ``--flag`` take the next word as its value, so in
-    ``eia-api --no-cache browse`` the subcommand name would be swallowed as the
-    value of ``--no-cache``. Rewriting ``--no-cache`` (or ``--no_cache``) to
-    ``--no_cache=True`` makes the flag work before or after the subcommand.
-    Arguments after a standalone ``--`` (Fire's own flags such as ``--help``)
-    are left untouched.
+    ``eia-api --no-cache browse`` the subcommand would be swallowed. Arguments
+    after a standalone ``--`` are left untouched.
 
     Args:
         argv (list[str]): The command-line arguments, without the program name.
@@ -2856,12 +2466,7 @@ def _bind_no_cache_flag(argv: list[str]) -> list[str]:
     Returns:
         list[str]: A new argument list with ``--no-cache`` bound explicitly.
     """
-    out: list[str] = []
-    for i, arg in enumerate(argv):
-        if arg == "--":
-            return out + argv[i:]
-        out.append("--no_cache=True" if arg in {"--no-cache", "--no_cache"} else arg)
-    return out
+    return bind_bool_flags(argv, ["no_cache"])
 
 
 def main() -> None:
@@ -2877,26 +2482,21 @@ def main() -> None:
         eia-api get-data electricity/retail-sales --data price --frequency monthly
         eia-api to-csv price.csv --route electricity/retail-sales --data price
 
-    Raises:
-        SystemExit: With code 1 after printing a concise message for an expected
-            error (missing API key, unknown route, HTTP failure); Fire also
-            raises ``SystemExit`` for CLI usage errors.
+    An expected error (missing API key, unknown route, HTTP failure) prints a
+    concise message and exits with code 1 (``SystemExit``); Fire also exits for
+    CLI usage errors.
     """
-    # Imported lazily so importing the library does not pull in Fire until the
-    # CLI is actually invoked.
-    import fire
-
     _keep_codes_as_text()
-    try:
-        fire.Fire(_Cli, name="eia-api", command=_bind_no_cache_flag(sys.argv[1:]))
-    except (ValueError, RuntimeError, requests.RequestException) as exc:
-        # Turn expected, user-facing errors (a missing key, an unknown route, an
-        # HTTP failure) into a concise message rather than a full traceback.
-        # The traceback still goes to the log (shown with --log-level DEBUG and
-        # always written to --log-file).
-        _log.debug("Command failed", exc_info=True)
-        print(f"Error: {exc}", file=sys.stderr)  # ruff: ignore[print]
-        raise SystemExit(1) from exc
+    # Expected, user-facing errors (a missing key, an unknown route, an HTTP
+    # failure) print a concise message; the traceback goes to the log (shown
+    # with --log-level DEBUG and always written to --log-file).
+    run(
+        _Cli,
+        name="eia-api",
+        logger=_log,
+        expected=(ValueError, RuntimeError, requests.RequestException),
+        argv=_bind_no_cache_flag(sys.argv[1:]),
+    )
 
 
 if __name__ == "__main__":
