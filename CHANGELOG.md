@@ -42,6 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   `~/.cache/eia_api` as before. `DEFAULT_CACHE_DIR` is exported from the
   package; the home directory is looked up when a client is built, not at
   import.
+- CI fails when test coverage drops below 92%: `fail_under = 92` in
+  `[tool.coverage.report]`, which `uv run pytest` enforces (coverage was
+  94.68% when the threshold was set).
 
 ### Fixed
 

@@ -50,6 +50,9 @@ uv run mypy                                             # strict
 uv run pytest                                           # also checks pyproject == CITATION
 ```
 
+`uv run pytest` also enforces test coverage >= 92% (`fail_under` in
+`[tool.coverage.report]`).
+
 Do not weaken the gate to make it pass. Fix the code, or if a rule is genuinely
 wrong for a case, add a narrowly-scoped ignore with a comment explaining why.
 
