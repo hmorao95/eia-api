@@ -12,6 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - The manual Publish workflow's version check (tag = pyproject = CITATION) now runs
   when the workflow is started from a release tag; it was tied to release events,
   which no longer trigger the workflow.
+- The shared plumbing (logging and key redaction, the disk cache and
+  `DEFAULT_CACHE_DIR`, the request throttle, the tidy-shape and polars helpers,
+  incremental updates, file writers and the CLI's Fire helpers) now comes from
+  [wrapkit](https://github.com/hmorao95/wrapkit) v0.1.0, installed from GitHub.
+  The public API, outputs and cache files are unchanged. `fire` and `colorlog`
+  are now installed through wrapkit.
+- The async client's throttle now spaces concurrent requests too (they queue
+  for their turn); before, tasks started together could all go at once.
 
 ## [0.3.0] - 2026-11-01
 

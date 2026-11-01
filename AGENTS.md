@@ -77,7 +77,11 @@ wrong for a case, add a narrowly-scoped ignore with a comment explaining why.
   any falsy value) disables the disk cache. Internal code that wants no cache
   passes `cache_dir=None` (as the CLI's `--no-cache` does).
 - **Line length**: formatter targets 88; `E501` allows up to 150.
-- **Imports**: fire is imported lazily inside `main()` on purpose.
+- **Imports**: fire is imported lazily (inside wrapkit's CLI helpers) on purpose.
+- **Shared plumbing**: logging and redaction, the disk cache, the throttle,
+  tidy/polars helpers, incremental updates, writers and Fire helpers come from
+  [wrapkit](https://github.com/hmorao95/wrapkit), pinned by tag in
+  `pyproject.toml`. Fix shared bugs there, release a tag, then bump the pin.
 
 ## Tests
 
