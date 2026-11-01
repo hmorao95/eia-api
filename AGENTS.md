@@ -82,8 +82,6 @@ wrong for a case, add a narrowly-scoped ignore with a comment explaining why.
   tidy/polars helpers, incremental updates, writers and Fire helpers come from
   [wrapkit](https://github.com/hmorao95/wrapkit), pinned by tag in
   `pyproject.toml`. Fix shared bugs there, release a tag, then bump the pin.
-  wrapkit is private: CI reads it with the `WRAPKIT_TOKEN` secret (a read-only
-  token), set up in the workflows' "Allow access to wrapkit" step.
 
 ## Tests
 

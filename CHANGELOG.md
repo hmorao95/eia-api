@@ -16,8 +16,6 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   `DEFAULT_CACHE_DIR`, the request throttle, the tidy-shape and polars helpers,
   incremental updates, file writers and the CLI's Fire helpers) now comes from
   [wrapkit](https://github.com/hmorao95/wrapkit) v0.1.0, installed from GitHub.
-  wrapkit is a private repository: installing needs read access to it, and CI
-  reads it with the `WRAPKIT_TOKEN` repository secret.
   The public API, outputs and cache files are unchanged. `fire` and `colorlog`
   are now installed through wrapkit.
 - The async client's throttle now spaces concurrent requests too (they queue
