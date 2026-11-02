@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- wrapkit pin moved from v0.1.0 to [v0.2.1](https://github.com/hmorao95/wrapkit/releases/tag/v0.2.1):
+  log lines mask registered secrets longest first, so a secret that
+  contains another is never masked in pieces. No other change here.
 - `pre-commit` is no longer a dev dependency: run the hooks with
   `uvx pre-commit` (for example `uvx pre-commit install`). This drops
   `virtualenv` and `filelock` from `uv.lock`; filelock has no patched release
