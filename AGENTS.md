@@ -106,8 +106,7 @@ wrong for a case, add a narrowly-scoped ignore with a comment explaining why.
 
 - Work on a branch (`feature/…`, `fix/…`, `chore/…`), open a PR, and squash-merge
   once CI is green. Reference issues with `Closes #N`.
-- **Commit as the repo owner. Never add a Co-Authored-By / AI-authorship trailer
-  to commits, tags or PRs.** Do not skip hooks or bypass signing.
+- **Commit as the repo owner.** Do not skip hooks or bypass signing.
 - **Releasing** (SemVer): after merging to `main`,
   1. move the `[Unreleased]` changelog items under a new `## [X.Y.Z] - <date>`
      section and update the compare links at the bottom;
