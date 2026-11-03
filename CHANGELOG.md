@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-03
+
+### Changed
+
+- `.gitignore` now also ignores LaTeX build files (`*.aux`, `*.log`,
+  `*.synctex.gz`, `*.fdb_latexmk` and the like) and Jupyter checkpoints
+  (`.ipynb_checkpoints/`). No change to the package.
+
 ## [0.4.0] - 2026-11-03
 
 ### Changed
@@ -157,7 +165,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   interrogate (docstring coverage), codespell, pre-commit hooks, and GitHub
   Actions CI and publish workflows.
 
-[Unreleased]: https://github.com/hmorao95/eia-api/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/hmorao95/eia-api/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/hmorao95/eia-api/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/hmorao95/eia-api/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/hmorao95/eia-api/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/hmorao95/eia-api/compare/v0.1.0...v0.2.0
