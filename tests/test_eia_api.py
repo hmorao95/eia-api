@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import operator
 import sys
 import time
 from pathlib import Path
@@ -424,6 +425,98 @@ def test_get_data_empty_returns_empty(
 
     monkeypatch.setattr(client, "_request", _empty)
     assert client.get_data("electricity/retail-sales", data="price").empty
+
+
+# Two states over three months: every period holds two rows, which tie when
+# sorted on ``period`` alone.
+_TIED_ROWS: list[dict[str, Any]] = [
+    {"period": p, "stateid": s, "sectorid": "RES", "price": "1.0"}
+    for p in ("2020-01", "2020-02", "2020-03")
+    for s in ("CA", "CO")
+]
+
+
+def _unstable_request(endpoint: str, params: list[tuple[str, str]]) -> dict[str, Any]:
+    """
+    Serve ``_TIED_ROWS`` sorted on the requested keys only, like a database.
+
+    Rows that tie on every requested key come back in an order that changes
+    with the offset (state ascending on the first page, descending after), as
+    an ``ORDER BY ... OFFSET ... LIMIT`` query may do between two requests.
+    """
+    if not endpoint.endswith("/data"):
+        return _fake_request(endpoint, params)
+    lookup = dict(params)
+    offset, length = int(lookup["offset"]), int(lookup["length"])
+    keys = []
+    i = 0
+    while f"sort[{i}][column]" in lookup:
+        keys.append((lookup[f"sort[{i}][column]"], lookup[f"sort[{i}][direction]"]))
+        i += 1
+    # The unstable tie order first, then stable sorts on the keys, last first.
+    rows = sorted(_TIED_ROWS, key=operator.itemgetter("stateid"), reverse=offset > 0)
+    for column, direction in reversed(keys):
+        rows.sort(key=operator.itemgetter(column), reverse=direction == "desc")
+    return {"total": str(len(rows)), "data": rows[offset : offset + length]}
+
+
+def test_get_data_pages_never_repeat_or_skip_tied_rows(
+    client: EIA, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rows tied on ``period`` are neither repeated nor lost between pages."""
+    monkeypatch.setattr(client, "_request", _unstable_request)
+    frame = client.get_data(_ROUTE, data="price", length=3)
+    got = sorted(zip(frame["period"], frame["stateid"], strict=True))
+    want = sorted((r["period"], r["stateid"]) for r in _TIED_ROWS)
+    assert got == want
+
+
+def test_async_get_data_pages_never_repeat_or_skip_tied_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The async client pages tied rows without repeats or gaps too."""
+    eia = eia_core.AsyncEIA(api_key="test-key", cache_dir="")
+
+    async def _areq(endpoint: str, params: list[tuple[str, str]]) -> dict[str, Any]:
+        return _unstable_request(endpoint, list(params))
+
+    monkeypatch.setattr(eia, "_request", _areq)
+    frame = asyncio.run(eia.get_data(_ROUTE, data="price", length=3))
+    got = sorted(zip(frame["period"], frame["stateid"], strict=True))
+    assert got == sorted((r["period"], r["stateid"]) for r in _TIED_ROWS)
+
+
+def test_get_data_sort_appends_period_and_facets(
+    client: EIA, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The caller's sort keys come first, then period and each facet id."""
+    sent: list[list[tuple[str, str]]] = []
+
+    def _recording(endpoint: str, params: list[tuple[str, str]]) -> dict[str, Any]:
+        if endpoint.endswith("/data"):
+            sent.append([p for p in params if p[0].startswith("sort[")])
+        return _fake_request(endpoint, params)
+
+    monkeypatch.setattr(client, "_request", _recording)
+    client.get_data(_ROUTE, data="price")
+    client.get_data(_ROUTE, data="price", sort=[("stateid", "desc")])
+    assert sent[0] == [
+        ("sort[0][column]", "period"),
+        ("sort[0][direction]", "asc"),
+        ("sort[1][column]", "stateid"),
+        ("sort[1][direction]", "asc"),
+        ("sort[2][column]", "sectorid"),
+        ("sort[2][direction]", "asc"),
+    ]
+    # A caller key keeps its place and direction and is not added twice.
+    assert sent[1] == [
+        ("sort[0][column]", "stateid"),
+        ("sort[0][direction]", "desc"),
+        ("sort[1][column]", "period"),
+        ("sort[1][direction]", "asc"),
+        ("sort[2][column]", "sectorid"),
+        ("sort[2][direction]", "asc"),
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -2038,3 +2131,24 @@ def test_bind_no_cache_flag_leaves_fire_flags_alone() -> None:
         "--",
         "--no-cache",
     ]
+
+
+@pytest.mark.parametrize("tidy", [False, True])
+def test_update_csv_renamed_label_replaces_the_row(
+    tclient: EIA, tmp_path: Path, *, tidy: bool
+) -> None:
+    """A label EIA has since renamed updates the stored row, not a second one."""
+    path = tmp_path / "labels.csv"
+    tclient.update_csv(path, _MULTI, data="price", tidy=tidy)
+    label = "stateid_name" if tidy else "stateDescription"
+    stored = pd.read_csv(path)
+    stored[label] = stored[label].replace("Colorado", "Colorado (old)")
+    stored.to_csv(path, index=False)
+
+    changed = tclient.update_csv(path, _MULTI, data="price", tidy=tidy)
+    assert changed[label].tolist() == ["Colorado"]
+    written = pd.read_csv(path)
+    assert len(written) == len(stored)
+    assert "Colorado (old)" not in written[label].tolist()
+    # Once updated, nothing is left to report.
+    assert tclient.new_observations(path, _MULTI, data="price", tidy=tidy).empty
