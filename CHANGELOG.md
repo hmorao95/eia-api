@@ -7,24 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-04
+
 ### Fixed
 
-- wrapkit is now pinned at v0.2.4 (was v0.2.1). Incremental updates keep
-  codes such as `"NA"` as text when they read back the stored CSV (they
-  were read as missing, so those rows turned into duplicates), and no
-  longer crash when a compared column goes between missing and a value. A
-  cache entry left half-written by a crash is re-fetched instead of raising.
-  A zero-byte stored CSV now counts as no prior extract.
 - `local-hourly` data no longer crashes `get_data`. Its period labels carry
   a UTC offset (`2024-11-03T01-05`), which the parser that builds the `date`
   column could not handle. These hours are now converted to UTC, so `date`
   stays a plain (timezone-free) UTC timestamp like `hourly` data, and the
   hour repeated when daylight saving time ends gets its own row instead of
   colliding with the first. The `period` column keeps the local label.
-- wrapkit is now pinned at v0.2.5 (was v0.2.4). Incremental updates match
-  a numeric key whether it reads `110` or `110.0` (a key column turns
-  float when a fetch has a gap in it), so a revised row replaces the
-  stored one instead of being added next to it.
 - `get_data` no longer repeats or drops rows between pages. It sorted on
   `period` only, so the rows of one period (one per state, sector, ...)
   could come back in a different order on each page. The sort now adds
@@ -39,6 +31,18 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   updated and reported as revised. Rows a past rename had already doubled
   in a stored CSV are merged into one on the next update, keeping the
   newest label.
+- wrapkit is now pinned at v0.2.6 (was v0.2.1), which brings these fixes:
+  - Codes such as `"NA"` (Namibia) stay text when the stored CSV is read back;
+    they used to turn blank, so those rows were re-added as duplicates.
+  - Stored numbers read back exactly, so on pandas before 3.1 unchanged values
+    no longer count as revisions and rewrite the file on every run.
+  - A zero-byte stored CSV counts as no prior extract.
+  - Comparing a column that goes between missing and a value no longer crashes
+    the update.
+  - A numeric key matches whether it reads `110` or `110.0`, so a revised row
+    replaces the stored one instead of being added next to it.
+  - A cache entry left half-written by a crash is fetched again instead of
+    raising.
 
 ### Security
 
@@ -211,7 +215,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   interrogate (docstring coverage), codespell, pre-commit hooks, and GitHub
   Actions CI and publish workflows.
 
-[Unreleased]: https://github.com/hmorao95/eia-api/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/hmorao95/eia-api/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/hmorao95/eia-api/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/hmorao95/eia-api/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/hmorao95/eia-api/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/hmorao95/eia-api/compare/v0.2.0...v0.3.0
