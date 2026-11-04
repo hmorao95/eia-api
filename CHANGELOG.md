@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- wrapkit is now pinned at v0.2.4 (was v0.2.1). Incremental updates keep
+  codes such as `"NA"` as text when they read back the stored CSV (they
+  were read as missing, so those rows turned into duplicates), and no
+  longer crash when a compared column goes between missing and a value. A
+  cache entry left half-written by a crash is re-fetched instead of raising.
+  A zero-byte stored CSV now counts as no prior extract.
+
 ### Security
 
 - The API key no longer reaches the disk cache. EIA echoes every request,
