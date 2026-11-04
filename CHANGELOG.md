@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-04
+
 ### Fixed
 
 - `local-hourly` data no longer crashes `get_data`. Its period labels carry
@@ -213,7 +215,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   interrogate (docstring coverage), codespell, pre-commit hooks, and GitHub
   Actions CI and publish workflows.
 
-[Unreleased]: https://github.com/hmorao95/eia-api/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/hmorao95/eia-api/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/hmorao95/eia-api/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/hmorao95/eia-api/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/hmorao95/eia-api/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/hmorao95/eia-api/compare/v0.2.0...v0.3.0
