@@ -25,6 +25,21 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   a numeric key whether it reads `110` or `110.0` (a key column turns
   float when a fetch has a gap in it), so a revised row replaces the
   stored one instead of being added next to it.
+- `get_data` no longer repeats or drops rows between pages. It sorted on
+  `period` only, so the rows of one period (one per state, sector, ...)
+  could come back in a different order on each page. The sort now adds
+  `period` and then each facet of the dataset, ascending, after any keys
+  you pass, so the order is fixed. This costs one metadata request when
+  `data` is given (it is cached). The request parameters change, so pages
+  cached by an earlier version are fetched again once.
+- `update_csv` and `new_observations` no longer add a second row when EIA
+  renames a facet label (such as `stateDescription`, or `stateid_name` in
+  the tidy shape). The label was part of the row key, so the renamed row
+  looked new. Labels are now compared like values: the stored row is
+  updated and reported as revised. Rows a past rename had already doubled
+  in a stored CSV are merged into one on the next update, keeping the
+  newest label.
+
 ### Security
 
 - The API key no longer reaches the disk cache. EIA echoes every request,

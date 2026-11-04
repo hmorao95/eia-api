@@ -464,6 +464,41 @@ def _encode_data_params(
     return params
 
 
+def _total_sort(
+    sort: Sequence[tuple[str, str]] | None, meta: Mapping[str, Any]
+) -> list[tuple[str, str]]:
+    """
+    Extend the sort keys so they put every row of a dataset in one fixed order.
+
+    The API pages with ``offset``/``length``, so rows that tie on every sort key
+    may come back in a different order from one page to the next and be
+    repeated or skipped at a page boundary. A row is identified by its period
+    and its facet values, so ``period`` and then each facet id from the route's
+    metadata are appended (ascending) after the caller's keys, unless already
+    there. With no ``sort`` the keys start from ``period`` ascending.
+
+    Args:
+        sort (Sequence[tuple[str, str]] | None): The caller's
+            ``(column, direction)`` keys, or ``None`` for the default.
+        meta (Mapping[str, Any]): The dataset's metadata (its ``facets`` list).
+
+    Returns:
+        list[tuple[str, str]]: The caller's keys followed by the tie-breakers.
+    """
+    keys = list(sort or [("period", "asc")])
+    facet_ids = [
+        str(f["id"])
+        for f in meta.get("facets", []) or []
+        if isinstance(f, dict) and f.get("id")
+    ]
+    named = {column for column, _ in keys}
+    for column in ["period", *facet_ids]:
+        if column not in named:
+            keys.append((column, "asc"))
+            named.add(column)
+    return keys
+
+
 def _rows_to_frame(rows: list[dict[str, Any]], columns: list[str]) -> pd.DataFrame:
     """
     Assemble the tidy DataFrame from accumulated rows (shared by both clients).
@@ -1169,8 +1204,10 @@ class EIA:
             end (str | None): Inclusive upper period bound, same formats.
             sort (Sequence[tuple[str, str]] | None): Sort keys as
                 ``(column, direction)`` pairs with direction ``"asc"`` or
-                ``"desc"``. Defaults to ``[("period", "asc")]`` for stable,
-                reproducible pagination.
+                ``"desc"``. Defaults to ``[("period", "asc")]``. ``period`` and
+                then each facet id are always appended (ascending) after the
+                given keys, so the row order is fixed and paging neither
+                repeats nor skips rows.
             offset (int): Row offset to begin at (rarely needed; pagination is
                 automatic).
             length (int): Page size per request, capped at 5000.
@@ -1203,10 +1240,10 @@ class EIA:
 
         route = self._normalize_route(route)
         columns = self._resolve_data(route, data)
-        # Default to period-ascending sorting: without an explicit sort the API's
-        # row order is not guaranteed stable across pages, which can duplicate or
-        # drop rows while paginating.
-        sort = sort or [("period", "asc")]
+        # Sort on period then every facet (after any caller keys): rows that tie
+        # on the sort keys can come back in a different order on each page,
+        # which duplicates or drops rows while paginating.
+        sort = _total_sort(sort, self.metadata(route))
         page = min(length, _MAX_LENGTH)
 
         rows = self._paginate(
@@ -1480,14 +1517,19 @@ class EIA:
     @classmethod
     def _row_key(
         cls, frame: pd.DataFrame, value_cols: list[str], *, tidy: bool
-    ) -> tuple[list[str], list[str]]:
+    ) -> tuple[list[str], list[str], list[str]]:
         """
-        Return a frame's key columns and the value columns compared for revisions.
+        Return a frame's key columns, compared values and facet label columns.
 
         In the default shape the key is ``period`` plus the facet columns and the
         compared values are the requested measures. In the tidy shape there is no
         ``period``, so ``date`` joins the key (dimensions plus ``variable`` plus
         ``date``) and the only compared value is ``value``.
+
+        A facet's label (``stateDescription`` after ``stateid``; ``stateid_name``
+        in the tidy shape) is left out of the key and returned on its own, to be
+        compared like a value: EIA renames labels now and then, and a label in
+        the key turned the renamed row into a second copy of the stored one.
 
         Args:
             frame (pd.DataFrame): A fetched frame in either shape.
@@ -1495,12 +1537,26 @@ class EIA:
             tidy (bool): Whether ``frame`` is in the tidy shape.
 
         Returns:
-            tuple[list[str], list[str]]: The key columns and the value columns.
+            tuple[list[str], list[str], list[str]]: The key columns, the
+            (numeric) value columns and the label columns.
         """
         if tidy:
             keys = [c for c in frame.columns if c not in _TIDY_VALUE_COLUMNS]
-            return keys, ["value"]
-        return cls._key_columns(frame, value_cols), value_cols
+            values = ["value"]
+        else:
+            keys, values = cls._key_columns(frame, value_cols), value_cols
+        labels: list[str] = []
+        prev: str | None = None
+        for col in keys:
+            # A label directly follows the id it names (see _dimension_map).
+            if prev is not None and (
+                col == f"{prev}_name" if tidy else bool(_LABEL_COLUMN.search(col))
+            ):
+                labels.append(col)
+                prev = None
+            else:
+                prev = None if col == "period" else col
+        return [c for c in keys if c not in labels], values, labels
 
     def new_observations(
         self,
@@ -1544,9 +1600,10 @@ class EIA:
         fresh: pd.DataFrame = self.get_data(
             route, data=value_cols, as_polars=False, **kwargs
         )
-        key_cols, compare_cols = self._row_key(
+        key_cols, compare_cols, label_cols = self._row_key(
             fresh, value_cols, tidy=bool(kwargs.get("tidy"))
         )
+        # Only the numeric values are parsed back; labels stay text.
         existing_frame = read_existing(
             existing, fresh, compare_cols, text_cols=["period"]
         )
@@ -1554,7 +1611,7 @@ class EIA:
             fresh,
             existing_frame,
             key_cols,
-            compare_cols,
+            [*compare_cols, *label_cols],
             include_revisions=include_revisions,
         )
         _log.info(
@@ -1607,9 +1664,10 @@ class EIA:
             _log.info("Created %s with %d rows", path, len(fresh))
             return fresh
 
-        key_cols, compare_cols = self._row_key(fresh, value_cols, tidy=tidy)
+        key_cols, compare_cols, label_cols = self._row_key(fresh, value_cols, tidy=tidy)
+        # Only the numeric values are parsed back; labels stay text.
         existing = read_existing(path, fresh, compare_cols, text_cols=["period"])
-        changed = select_new(fresh, existing, key_cols, compare_cols)
+        changed = select_new(fresh, existing, key_cols, [*compare_cols, *label_cols])
         if changed.empty:
             # Already up to date; leave the file untouched.
             _log.info("%s is already up to date", path)
@@ -2010,7 +2068,8 @@ class AsyncEIA:
             start (str | None): Inclusive lower period bound.
             end (str | None): Inclusive upper period bound.
             sort (Sequence[tuple[str, str]] | None): Sort keys; defaults to
-                ``[("period", "asc")]`` for stable pagination.
+                ``[("period", "asc")]``, with ``period`` and the facet ids
+                appended as tie-breakers (see :meth:`EIA.get_data`).
             offset (int): Starting row offset (pagination is automatic).
             length (int): Page size per request, capped at 5000.
             max_rows (int | None): Stop after this many rows; ``None`` for all.
@@ -2031,7 +2090,8 @@ class AsyncEIA:
 
         route = _norm_route(route)
         columns = await self._resolve_data(route, data)
-        sort = sort or [("period", "asc")]
+        # Period then every facet, so pages never repeat or skip a row.
+        sort = _total_sort(sort, await self.metadata(route))
         page = min(length, _MAX_LENGTH)
 
         rows: list[dict[str, Any]] = []
