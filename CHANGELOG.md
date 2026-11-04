@@ -21,7 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   stays a plain (timezone-free) UTC timestamp like `hourly` data, and the
   hour repeated when daylight saving time ends gets its own row instead of
   colliding with the first. The `period` column keeps the local label.
-
+- wrapkit is now pinned at v0.2.5 (was v0.2.4). Incremental updates match
+  a numeric key whether it reads `110` or `110.0` (a key column turns
+  float when a fetch has a gap in it), so a revised row replaces the
+  stored one instead of being added next to it.
 ### Security
 
 - The API key no longer reaches the disk cache. EIA echoes every request,
