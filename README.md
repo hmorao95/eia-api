@@ -25,7 +25,8 @@ capped at 5000 rows. This wrapper handles that for you:
 - Fetches a dataset into a tidy `pandas` DataFrame, **paginating automatically**
   past the 5000-row limit and encoding facet filters for you.
 - Coerces value columns to numbers and adds a parsed `date` column alongside the
-  API's native `period` label (year, month, quarter, date or hour).
+  API's native `period` label (year, month, quarter, date or hour). Hours are
+  in UTC; `local-hourly` labels such as `2024-11-03T01-05` are converted to UTC.
 - Exports straight to CSV/Excel/Parquet/JSON, and keeps a long CSV current with
   incremental upserts (append new periods, overwrite revisions).
 - Caches raw JSON responses on disk (24 h TTL) so repeat calls are fast.

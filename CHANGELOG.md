@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   longer crash when a compared column goes between missing and a value. A
   cache entry left half-written by a crash is re-fetched instead of raising.
   A zero-byte stored CSV now counts as no prior extract.
+- `local-hourly` data no longer crashes `get_data`. Its period labels carry
+  a UTC offset (`2024-11-03T01-05`), which the parser that builds the `date`
+  column could not handle. These hours are now converted to UTC, so `date`
+  stays a plain (timezone-free) UTC timestamp like `hourly` data, and the
+  hour repeated when daylight saving time ends gets its own row instead of
+  colliding with the first. The `period` column keeps the local label.
 
 ### Security
 
