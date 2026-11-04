@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Security
+
+- The API key no longer reaches the disk cache. EIA echoes every request,
+  key included, under `request.params`, and the payload was cached as
+  received. The key is now dropped before caching. Cache files written by
+  earlier versions still hold it: delete `~/.cache/eia_api` (or your
+  `cache_dir`) once after upgrading.
+- HTTP errors no longer show the API key. The messages of `requests` and
+  `httpx` errors quote the request URL, so the CLI's `Error:` line (and any
+  traceback) printed the key. They are re-raised with the key masked, without
+  the original chained. An `httpx.HTTPStatusError` from `AsyncEIA` now comes
+  out as a plain `httpx.HTTPError`.
+
 ## [0.4.1] - 2026-11-03
 
 ### Changed
