@@ -1180,6 +1180,70 @@ def test_request_logs_without_the_key(
     assert canary not in caplog.text
 
 
+def test_cache_file_never_holds_the_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """EIA echoes the key under request.params; it is dropped before caching."""
+    canary = "cache-canary-key-789"
+    eia = EIA(api_key=canary, cache_dir=tmp_path, requests_per_second=None)
+    payload = {
+        "response": {"total": 0},
+        "request": {"command": "/v2/electricity/", "params": {"api_key": canary}},
+    }
+    monkeypatch.setattr(eia.session, "get", lambda *a, **k: _FakeResponse(payload))
+    assert eia._request("electricity", eia._params()) == {"total": 0}
+    files = list(tmp_path.glob("*.json"))
+    assert len(files) == 1
+    text = files[0].read_text("utf-8")
+    assert canary not in text
+    assert '"command"' in text  # the rest of the echo is kept
+
+
+def test_transport_error_masks_the_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A requests error, whose message quotes the URL, comes out with the key masked."""
+    canary = "error-canary-key-321"
+    eia = EIA(api_key=canary, cache_dir="", requests_per_second=None)
+
+    def _fail(*_a: Any, **_k: Any) -> None:
+        """Raise the kind of error a dead network gives, URL and key included."""
+        url = f"/v2/electricity?api_key={canary}"
+        msg = f"HTTPSConnectionPool(host='api.eia.gov'): Max retries exceeded with url: {url}"
+        raise requests.ConnectionError(msg)
+
+    monkeypatch.setattr(eia.session, "get", _fail)
+    with pytest.raises(requests.ConnectionError) as info:
+        eia._request("electricity", eia._params())
+    assert canary not in str(info.value)
+    assert info.value.__cause__ is None
+    assert info.value.__suppress_context__
+
+
+def test_async_http_status_error_masks_the_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An httpx status error, which quotes the URL, comes out with the key masked."""
+    canary = "async-canary-key-654"
+    eia = eia_core.AsyncEIA(api_key=canary, cache_dir="", requests_per_second=None)
+
+    async def _fake_send(
+        self: httpx.AsyncClient, request: httpx.Request, **_k: Any
+    ) -> httpx.Response:
+        """Answer every request with a bare 502."""
+        return httpx.Response(502, json={}, request=request)
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", _fake_send)
+
+    async def _run() -> None:
+        """Make one failing request, then close the client."""
+        try:
+            await eia._request("electricity", eia._params())
+        finally:
+            await eia.aclose()
+
+    with pytest.raises(httpx.HTTPError) as info:
+        asyncio.run(_run())
+    assert canary not in str(info.value)
+    assert "api_key=***" in str(info.value)
+
+
 def test_cache_hit_is_logged(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

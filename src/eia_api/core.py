@@ -236,6 +236,56 @@ def _disk_cache(cache_dir: Path | None, ttl_seconds: float) -> DiskCache:
     return DiskCache(cache_dir, ttl_seconds, hidden=["api_key"], logger=_log)
 
 
+def _without_key(payload: dict[str, Any]) -> dict[str, Any]:
+    """
+    Drop the API key that EIA echoes back in a payload, before it is cached.
+
+    Every answer repeats the request under ``request.params``, the key
+    included, so caching the payload as received would write the secret to
+    disk. The ``response`` object the client returns is left untouched.
+
+    Args:
+        payload (dict[str, Any]): A decoded API answer.
+
+    Returns:
+        dict[str, Any]: The same payload without ``request.params.api_key``.
+    """
+    request = payload.get("request")
+    params = request.get("params") if isinstance(request, dict) else None
+    if isinstance(params, dict):
+        params.pop("api_key", None)
+    return payload
+
+
+def _redacted(exc: Exception) -> Exception:
+    """
+    Copy an HTTP error with the API key masked in its message.
+
+    The messages of ``requests`` and ``httpx`` errors quote the request URL,
+    whose query string carries the key; the CLI prints that message and a
+    traceback would show it. Raise the copy ``from None`` so the original
+    (and its text) stays out of tracebacks.
+
+    Args:
+        exc (Exception): A ``requests.RequestException`` or ``httpx.HTTPError``.
+
+    Returns:
+        Exception: An error of the same type where it can be rebuilt from a
+        message (otherwise ``requests.RequestException`` or
+        ``httpx.HTTPError``), with the key masked.
+    """
+    text = _REDACT_FILTER.redact(str(exc))
+    fallback = (
+        httpx.HTTPError
+        if isinstance(exc, httpx.HTTPError)
+        else requests.RequestException
+    )
+    try:
+        return type(exc)(text)
+    except TypeError:  # httpx.HTTPStatusError needs request/response too.
+        return fallback(text)
+
+
 def _routes_frame(meta: Mapping[str, Any]) -> pd.DataFrame:
     """
     Build the child-route DataFrame from a route's metadata object.
@@ -771,6 +821,8 @@ class EIA:
         as a top-level ``error`` field (e.g. a missing or invalid key) rather
         than always via the HTTP status, so that is checked explicitly and turned
         into a clear exception.
+        Transport and HTTP errors are re-raised with the key masked in their
+        message, since it quotes the request URL.
 
         Args:
             endpoint (str): The route path to request, below the base URL and
@@ -795,9 +847,14 @@ class EIA:
         self._throttle()
         _log.debug("GET %s %s", endpoint, _loggable(params))
         started = time.monotonic()
-        resp = self.session.get(
-            _BASE_URL + endpoint, params=list(params), timeout=self.timeout
-        )
+        try:
+            resp = self.session.get(
+                _BASE_URL + endpoint, params=list(params), timeout=self.timeout
+            )
+        except requests.RequestException as exc:
+            # The message quotes the URL, key included; mask it.
+            error = _redacted(exc)
+            raise error from None
         _log.debug(
             "HTTP %s for %s in %.2fs",
             resp.status_code,
@@ -809,10 +866,14 @@ class EIA:
         # (often alongside a 200/403), so surface that before raise_for_status.
         if isinstance(payload, dict) and payload.get("error"):
             msg = f"EIA API error: {payload['error']} (code {payload.get('code')})"
-            raise RuntimeError(msg)
-        resp.raise_for_status()
+            raise RuntimeError(_REDACT_FILTER.redact(msg))
+        try:
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            error = _redacted(exc)
+            raise error from None
 
-        cache.put(endpoint, params, payload)
+        cache.put(endpoint, params, _without_key(payload))
         response: dict[str, Any] = payload["response"]
         return response
 
@@ -1688,7 +1749,8 @@ class AsyncEIA:
         The sync/async twin of :meth:`EIA._request`: it serves a fresh cached
         payload when one exists within the TTL; otherwise throttles, calls the
         API over httpx, surfaces the API's top-level ``error`` field as a clear
-        exception, persists the payload and returns it.
+        exception, persists the payload and returns it. HTTP errors are
+        re-raised with the key masked, as in the sync client.
 
         Args:
             endpoint (str): The route path to request, below the base URL and
@@ -1715,9 +1777,14 @@ class AsyncEIA:
             self._owns_client = True
         _log.debug("GET %s %s", endpoint, _loggable(params))
         started = time.monotonic()
-        resp = await self._client.get(
-            _BASE_URL + endpoint, params=list(params), timeout=self.timeout
-        )
+        try:
+            resp = await self._client.get(
+                _BASE_URL + endpoint, params=list(params), timeout=self.timeout
+            )
+        except httpx.HTTPError as exc:
+            # The message quotes the URL, key included; mask it.
+            error = _redacted(exc)
+            raise error from None
         _log.debug(
             "HTTP %s for %s in %.2fs",
             resp.status_code,
@@ -1727,10 +1794,14 @@ class AsyncEIA:
         payload = resp.json()
         if isinstance(payload, dict) and payload.get("error"):
             msg = f"EIA API error: {payload['error']} (code {payload.get('code')})"
-            raise RuntimeError(msg)
-        resp.raise_for_status()
+            raise RuntimeError(_REDACT_FILTER.redact(msg))
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            error = _redacted(exc)
+            raise error from None
 
-        cache.put(endpoint, params, payload)
+        cache.put(endpoint, params, _without_key(payload))
         response: dict[str, Any] = payload["response"]
         return response
 
