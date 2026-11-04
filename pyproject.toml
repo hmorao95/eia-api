@@ -14,7 +14,7 @@ dependencies = [
     "openpyxl>=3.1",
     "pyarrow>=15.0",
     # Shared plumbing (logging, cache, throttle, frames, CLI helpers), by tag.
-    "wrapkit @ git+https://github.com/hmorao95/wrapkit@v0.2.1",
+    "wrapkit @ git+https://github.com/hmorao95/wrapkit@v0.2.4",
 ]
 
 [project.optional-dependencies]
