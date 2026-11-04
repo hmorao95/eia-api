@@ -225,6 +225,27 @@ def test_parse_period_handles_all_frequencies() -> None:
     assert out.iloc[4] == pd.Timestamp("2020-03-15 05:00:00")
 
 
+def test_parse_period_local_hourly_converts_to_utc() -> None:
+    """Local-hourly labels with an offset parse to naive UTC, DST hours apart."""
+    out = EIA._parse_period(
+        pd.Series(
+            [
+                "2024-01-01T05-05",
+                "2024-11-03T01-04",  # the first 01:00 of the fall-back day
+                "2024-11-03T01-05",  # the repeated 01:00, an hour later
+                "2024-01-01T05",  # a plain (UTC) hourly label alongside
+            ]
+        )
+    )
+    assert out.dtype == "datetime64[ns]"
+    assert out.tolist() == [
+        pd.Timestamp("2024-01-01 10:00"),
+        pd.Timestamp("2024-11-03 05:00"),
+        pd.Timestamp("2024-11-03 06:00"),
+        pd.Timestamp("2024-01-01 05:00"),
+    ]
+
+
 def test_data_params_encodes_brackets() -> None:
     """Data, facet, sort and pagination params use the API's bracket syntax."""
     params = EIA._data_params(
@@ -1489,6 +1510,19 @@ _PLANT_ROWS: list[dict[str, Any]] = [
     {"period": "2020-01", "plantid": "01", "gen": "2.5", "gen-units": "MWh"},
 ]
 
+# A local-hourly route spanning a DST fall-back: 01:00 occurs twice, at offsets
+# -04 and -05.
+_LOCAL_HOURLY_ROUTE = "electricity/rto/region-data"
+_LOCAL_HOURLY_ROWS: list[dict[str, Any]] = [
+    {"period": p, "respondent": "PJM", "gen": g, "gen-units": "MWh"}
+    for p, g in [
+        ("2024-11-03T00-04", "1.0"),
+        ("2024-11-03T01-04", "2.0"),
+        ("2024-11-03T01-05", "3.0"),
+        ("2024-11-03T02-05", "4.0"),
+    ]
+]
+
 # Value columns of the extra synthetic routes (served as their metadata).
 _EXTRA_MEASURES = {"price", "sales", "customers", "gen"}
 
@@ -1515,7 +1549,11 @@ def _tidy_request(
 def tclient(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> EIA:
     """A client whose synthetic API also serves the multi-measure routes."""
     eia = EIA(api_key="test-key", cache_dir=tmp_path / "cache")
-    rows = {_MULTI: _MULTI_ROWS, _PLANT_ROUTE: _PLANT_ROWS}
+    rows = {
+        _MULTI: _MULTI_ROWS,
+        _PLANT_ROUTE: _PLANT_ROWS,
+        _LOCAL_HOURLY_ROUTE: _LOCAL_HOURLY_ROWS,
+    }
     monkeypatch.setattr(eia, "_request", _tidy_request(rows))
     return eia
 
@@ -1748,6 +1786,28 @@ def test_update_csv_numeric_looking_keys_round_trip(
     tclient.update_csv(path, _PLANT_ROUTE, data="gen", tidy=tidy)
     assert tclient.update_csv(path, _PLANT_ROUTE, data="gen", tidy=tidy).empty
     assert tclient.new_observations(path, _PLANT_ROUTE, data="gen", tidy=tidy).empty
+
+
+@pytest.mark.parametrize("tidy", [False, True])
+def test_update_csv_local_hourly_keeps_both_dst_hours(
+    tclient: EIA, tmp_path: Path, *, tidy: bool
+) -> None:
+    """The repeated DST hour is a new row, not a revision of the first one."""
+    path = tmp_path / "hourly.csv"
+    full = tclient.get_data(_LOCAL_HOURLY_ROUTE, data="gen", tidy=tidy)
+    assert full["date"].is_unique
+    # Store up to the first 01:00 (-04); the repeated 01:00 (-05) is then new.
+    full.iloc[:2].to_csv(path, index=False)
+
+    new = tclient.update_csv(path, _LOCAL_HOURLY_ROUTE, data="gen", tidy=tidy)
+    assert new["date"].tolist() == [
+        pd.Timestamp("2024-11-03 06:00"),
+        pd.Timestamp("2024-11-03 07:00"),
+    ]
+    written = pd.read_csv(path)
+    value = "value" if tidy else "gen"
+    assert written[value].tolist() == [1.0, 2.0, 3.0, 4.0]
+    assert tclient.update_csv(path, _LOCAL_HOURLY_ROUTE, data="gen", tidy=tidy).empty
 
 
 def test_cli_get_data_tidy(cli: eia_core._Cli) -> None:

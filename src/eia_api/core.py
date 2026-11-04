@@ -365,8 +365,11 @@ def _parse_period_series(period: pd.Series) -> pd.Series:
 
     Labels vary by frequency: a bare year (``"2020"``), a month (``"2020-03"``),
     a quarter (``"2020-Q1"``), a date (``"2020-03-15"``) or an hour
-    (``"2020-03-15T05"``). Quarters map to their first month; everything else
-    uses pandas' mixed-format parser. Unparseable labels become ``NaT``.
+    (``"2020-03-15T05"``, in UTC). Quarters map to their first month. A
+    ``local-hourly`` label carries its UTC offset (``"2020-03-15T05-05"``) and
+    is converted to UTC, so the result stays naive UTC like plain hourly labels
+    and the repeated hour of a DST change stays distinct. Everything else uses
+    pandas' mixed-format parser. Unparseable labels become ``NaT``.
 
     Args:
         period (pd.Series): The raw ``period`` column returned by the API.
@@ -387,9 +390,22 @@ def _parse_period_series(period: pd.Series) -> pd.Series:
             {"year": parts[0].astype(int), "month": months, "day": 1}
         ).to_numpy()
 
+    # Local-hourly labels end in the hour's UTC offset ("2024-11-03T01-05").
+    # Parse them as UTC and drop the zone: the column stays naive (as for plain
+    # hourly labels, which are UTC), and the two 01:00 hours of a DST fall-back
+    # day (offsets -04 and -05) map to different instants instead of crashing
+    # the parser with mixed offsets.
+    is_local = s.str.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}[+-]\d{2}", na=False)
+    if is_local.any():
+        out.loc[is_local] = (
+            pd.to_datetime(s[is_local] + "00", format="%Y-%m-%dT%H%z", utc=True)
+            .dt.tz_localize(None)
+            .to_numpy()
+        )
+
     # Everything else (year/month/date/hour) parses directly; "mixed" opts in to
     # per-element inference so heterogeneous labels do not warn.
-    rest = ~is_q
+    rest = ~is_q & ~is_local
     if rest.any():
         out.loc[rest] = pd.to_datetime(
             s[rest], errors="coerce", format="mixed"
@@ -1043,8 +1059,9 @@ class EIA:
         EIA period labels vary by frequency: a bare year (``"2020"``), a month
         (``"2020-03"``), a quarter (``"2020-Q1"``), a date (``"2020-03-15"``) or
         an hour (``"2020-03-15T05"``). Quarters are mapped to their first month;
-        everything else is parsed with pandas' mixed-format parser. Labels that do
-        not parse become ``NaT``.
+        ``local-hourly`` labels with a UTC offset (``"2020-03-15T05-05"``) are
+        converted to naive UTC; everything else is parsed with pandas'
+        mixed-format parser. Labels that do not parse become ``NaT``.
 
         Args:
             period (pd.Series): The raw ``period`` column returned by the API.
