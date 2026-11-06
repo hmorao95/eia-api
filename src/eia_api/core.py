@@ -61,6 +61,7 @@ import os  # Reads the EIA_API_KEY environment variable as a key fallback.
 import re  # Recognises facet label columns (stateDescription, ...).
 import sys  # Reads the CLI's command-line arguments.
 import time  # Times each request for the debug log.
+from collections.abc import Iterable, Mapping  # Checks facet filter shapes.
 from dataclasses import dataclass  # Builds the immutable Route value type.
 from pathlib import Path  # Cross-platform filesystem paths for the cache/outputs.
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, overload  # Typing helpers.
@@ -106,7 +107,7 @@ from wrapkit.log import (  # Shared logging and key redaction.
 if TYPE_CHECKING:
     # Imported only for type checking to keep the runtime import graph small;
     # these names are used purely in annotations.
-    from collections.abc import Iterable, Mapping, Sequence
+    from collections.abc import Sequence
 
     # polars is an optional extra, imported lazily at runtime (``_as_polars``).
     import polars as pl
@@ -443,14 +444,28 @@ def _encode_data_params(
 
     Returns:
         list[tuple[str, str]]: The encoded query parameters (without the key).
+
+    Raises:
+        ValueError: If ``facets`` is not a mapping (for example the raw text of
+            a CLI ``--facets`` value that could not be parsed).
     """
+    if facets is not None and not isinstance(facets, Mapping):
+        msg = (
+            "facets must be a mapping of facet id to value(s), such as "
+            f"{{stateid: [CO, TX]}}; got {type(facets).__name__} {facets!r}."
+        )
+        raise ValueError(msg)
     params: list[tuple[str, str]] = []
     if frequency:
         params.append(("frequency", frequency))
     params.extend(("data[]", col) for col in columns)
     for facet_id, values in (facets or {}).items():
-        # Accept a single value as a plain string, not only an iterable.
-        items = [values] if isinstance(values, str) else list(values)
+        # Accept a single value (a plain string, or a number such as a plant
+        # id that the CLI parsed as an int), not only an iterable.
+        if isinstance(values, (str, bytes)) or not isinstance(values, Iterable):
+            items: list[object] = [values]
+        else:
+            items = list(values)
         params.extend((f"facets[{facet_id}][]", str(v)) for v in items)
     if start:
         params.append(("start", str(start)))
@@ -1428,8 +1443,9 @@ class EIA:
         Fetch data and write it to an Excel (.xlsx) workbook in one step.
 
         The Excel counterpart of :meth:`to_csv`, using the bundled ``openpyxl``
-        engine. The parsed ``date`` column is written as plain calendar days so
-        Excel does not show a spurious midnight time component.
+        engine. A parsed ``date`` column that holds only midnights (daily and
+        coarser data) is written as plain calendar days so Excel does not show
+        a spurious midnight time component; hourly timestamps keep their time.
 
         Args:
             path (str | Path): Destination ``.xlsx`` path.
@@ -1443,8 +1459,11 @@ class EIA:
         path = Path(path)
         # Excel renders a datetime cell with a time component; convert the parsed
         # dates to plain ``date`` objects so Excel shows just the day.
+        # Only when every timestamp is at midnight: hourly data keeps its time.
         if "date" in frame.columns:
-            frame["date"] = pd.to_datetime(frame["date"]).dt.date
+            dates = pd.to_datetime(frame["date"])
+            if (dates.dropna() == dates.dropna().dt.normalize()).all():
+                frame["date"] = dates.dt.date
         write_frame(frame, path, "excel")
         _log.info("Wrote %d rows to %s", len(frame), path)
         return path
@@ -2600,21 +2619,27 @@ def _keep_codes_as_text() -> None:
     set_parse_fns(_Cli, _CODE_PARSERS)
 
 
-def _bind_no_cache_flag(argv: list[str]) -> list[str]:
+#: Every boolean CLI parameter, pinned to ``True`` when given bare.
+_BOOL_FLAGS = ("no_cache", "tidy")
+
+
+def _bind_bool_flags(argv: list[str]) -> list[str]:
     """
-    Pin a bare ``--no-cache`` to ``True`` wherever it appears on the command line.
+    Pin each bare boolean flag to ``True`` wherever it appears on the command line.
 
     Fire lets a bare ``--flag`` take the next word as its value, so in
-    ``eia-api --no-cache browse`` the subcommand would be swallowed. Arguments
-    after a standalone ``--`` are left untouched.
+    ``eia-api --no-cache browse`` the subcommand would be swallowed, and in
+    ``eia-api update-csv --tidy out.csv ...`` the path would. Every flag in
+    :data:`_BOOL_FLAGS` is bound explicitly. Arguments after a standalone
+    ``--`` are left untouched.
 
     Args:
         argv (list[str]): The command-line arguments, without the program name.
 
     Returns:
-        list[str]: A new argument list with ``--no-cache`` bound explicitly.
+        list[str]: A new argument list with the boolean flags bound explicitly.
     """
-    return bind_bool_flags(argv, ["no_cache"])
+    return bind_bool_flags(argv, _BOOL_FLAGS)
 
 
 def main() -> None:
@@ -2643,7 +2668,7 @@ def main() -> None:
         name="eia-api",
         logger=_log,
         expected=(ValueError, RuntimeError, requests.RequestException),
-        argv=_bind_no_cache_flag(sys.argv[1:]),
+        argv=_bind_bool_flags(sys.argv[1:]),
     )
 
 
