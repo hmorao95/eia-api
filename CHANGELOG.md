@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Changed
+
+- wrapkit is now pinned at v0.2.7 (was v0.2.6). Its one fix, month labels
+  such as `2024-6` in period bounds, is in a part this package does not use,
+  so nothing changes here.
+
 ### Fixed
 
 - A `--facets` value the CLI cannot parse (such as `{stateid: [CO, TX}`, a
