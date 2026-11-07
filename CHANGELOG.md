@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   as a calendar day, so all 24 hours of a day showed the same date. Dates
   are now written as plain days only when every timestamp is at midnight;
   hourly data keeps its time.
+- An empty facet list, such as `facets={"stateid": []}`, now raises a
+  `ValueError`. It used to drop the filter and fetch every state.
+- `update_csv` no longer breaks when the first fetch returns no rows. It
+  wrote a CSV holding only a newline, and every later run failed with
+  `EmptyDataError`. It now writes nothing in that case, and a blank file left
+  by an earlier version is treated like a missing one.
 
 ## [0.4.2] - 2026-11-04
 
