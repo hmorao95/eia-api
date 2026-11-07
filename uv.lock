@@ -615,7 +615,7 @@ requires-dist = [
     { name = "polars", marker = "extra == 'polars'", specifier = ">=1.0" },
     { name = "pyarrow", specifier = ">=15.0" },
     { name = "requests", specifier = ">=2.28" },
-    { name = "wrapkit", git = "https://github.com/hmorao95/wrapkit?rev=v0.2.6" },
+    { name = "wrapkit", git = "https://github.com/hmorao95/wrapkit?rev=v0.2.7" },
 ]
 provides-extras = ["polars"]
 
@@ -2401,8 +2401,8 @@ wheels = [
 
 [[package]]
 name = "wrapkit"
-version = "0.2.6"
-source = { git = "https://github.com/hmorao95/wrapkit?rev=v0.2.6#f9d91d403933d3f10753e7d0ee6a8f4b9bbd831d" }
+version = "0.2.7"
+source = { git = "https://github.com/hmorao95/wrapkit?rev=v0.2.7#d7642e150e9c41df302ab20ddc4a3d00f333c206" }
 dependencies = [
     { name = "colorlog" },
     { name = "fire" },
