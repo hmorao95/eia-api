@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- A `--facets` value the CLI cannot parse (such as `{stateid: [CO, TX}`, a
+  missing bracket) no longer ends in a Python traceback. `get_data` now
+  raises a `ValueError` when `facets` is not a mapping, and the CLI prints
+  it as a one-line error and exits with code 1.
+- A bare `--tidy` no longer swallows the next argument. In
+  `eia-api update-csv --tidy out.csv electricity/retail-sales ...` the path
+  was taken as the value of `--tidy`, so the command failed or wrote the
+  wrong shape. Every boolean flag (`--tidy`, `--no-cache`) is now pinned to
+  `True` when given bare, wherever it appears.
+- A single facet value that is a number, such as `facets={"plantid": 3}` or
+  the CLI's `--facets "{stateid: 8}"` (which Fire parses as an int), no
+  longer raises `TypeError`. It is sent as one value, like a string.
+- `to_excel` no longer cuts hourly timestamps to days. It wrote every `date`
+  as a calendar day, so all 24 hours of a day showed the same date. Dates
+  are now written as plain days only when every timestamp is at midnight;
+  hourly data keeps its time.
+
 ## [0.4.2] - 2026-11-04
 
 ### Fixed

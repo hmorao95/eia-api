@@ -9,6 +9,7 @@ stubbing the ``requests.Session`` used underneath it.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import operator
 import sys
@@ -2122,12 +2123,13 @@ def test_cli_caches_by_default_and_no_cache_disables(
     assert default.is_dir() is cached
 
 
-def test_bind_no_cache_flag_leaves_fire_flags_alone() -> None:
-    """Only bare ``--no-cache`` before ``--`` is rewritten."""
-    argv = ["--no-cache", "browse", "--", "--no-cache"]
-    assert eia_core._bind_no_cache_flag(argv) == [
+def test_bind_bool_flags_leaves_fire_flags_alone() -> None:
+    """Only bare boolean flags before ``--`` are rewritten."""
+    argv = ["--no-cache", "browse", "--tidy", "--", "--no-cache"]
+    assert eia_core._bind_bool_flags(argv) == [
         "--no_cache=True",
         "browse",
+        "--tidy=True",
         "--",
         "--no-cache",
     ]
@@ -2152,3 +2154,96 @@ def test_update_csv_renamed_label_replaces_the_row(
     assert "Colorado (old)" not in written[label].tolist()
     # Once updated, nothing is left to report.
     assert tclient.new_observations(path, _MULTI, data="price", tidy=tidy).empty
+
+
+# --------------------------------------------------------------------------- #
+# Review fixes (2026-11-06)
+# --------------------------------------------------------------------------- #
+
+
+def test_get_data_rejects_non_mapping_facets(client: EIA) -> None:
+    """Facets that are not a mapping raise a clear ValueError, not AttributeError."""
+    unparsed: Any = "{stateid: [CO, TX}"  # what Fire passes on for bad --facets
+    with pytest.raises(ValueError, match="facets must be a mapping"):
+        client.get_data(_ROUTE, data="price", facets=unparsed)
+
+
+def test_main_reports_unparsable_facets_cleanly(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """A ``--facets`` value Fire cannot parse exits 1 with a message, no traceback."""
+    monkeypatch.setenv("EIA_API_KEY", "k")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        EIA, "_request", lambda _self, endpoint, params: _fake_request(endpoint, params)
+    )
+    argv = ["eia-api", "--no-cache", "get-data", _ROUTE, "--data", "price"]
+    monkeypatch.setattr(sys, "argv", [*argv, "--facets", "{stateid: [CO, TX}"])
+    with pytest.raises(SystemExit) as excinfo:
+        eia_core.main()
+    assert excinfo.value.code == 1
+    assert "Error: facets must be a mapping" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", [3, 3.0, ["3", 4]])
+def test_get_data_accepts_scalar_facet_values(
+    tclient: EIA, monkeypatch: pytest.MonkeyPatch, value: object
+) -> None:
+    """A number (as Fire parses ``{plantid: 3}``) is sent as one facet value."""
+    sent: list[list[tuple[str, str]]] = []
+    serve = tclient._request
+
+    def _recording(endpoint: str, params: list[tuple[str, str]]) -> dict[str, Any]:
+        if endpoint.endswith("/data"):
+            sent.append([p for p in params if p[0].startswith("facets[")])
+        return serve(endpoint, params)
+
+    monkeypatch.setattr(tclient, "_request", _recording)
+    facets: Any = {"plantid": value}
+    tclient.get_data(_PLANT_ROUTE, data="gen", facets=facets)
+    values = value if isinstance(value, list) else [value]
+    assert sent[0] == [("facets[plantid][]", str(v)) for v in values]
+
+
+def test_every_bool_cli_parameter_is_pinned() -> None:
+    """Each boolean parameter of every CLI command is in ``_BOOL_FLAGS``."""
+    found = {
+        name
+        for _, command in inspect.getmembers(eia_core._Cli, inspect.isfunction)
+        for name, param in inspect.signature(command).parameters.items()
+        if param.annotation in {bool, "bool"}
+    }
+    assert found == set(eia_core._BOOL_FLAGS)
+
+
+def test_main_bare_tidy_does_not_swallow_the_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``update-csv --tidy out.csv <route>`` writes ``out.csv`` in the tidy shape."""
+    monkeypatch.setenv("EIA_API_KEY", "k")
+    monkeypatch.setattr(
+        EIA, "_request", lambda _self, endpoint, params: _fake_request(endpoint, params)
+    )
+    out = tmp_path / "out.csv"
+    argv = ["eia-api", "--no-cache", "update-csv", "--tidy", str(out), _ROUTE]
+    monkeypatch.setattr(sys, "argv", [*argv, "--data", "price"])
+    eia_core.main()
+    written = pd.read_csv(out)
+    assert {"variable", "value", "unit"} <= set(written.columns)
+    assert len(written) == 3
+
+
+@pytest.mark.parametrize("tidy", [False, True])
+def test_to_excel_keeps_hourly_times(
+    tclient: EIA, tmp_path: Path, *, tidy: bool
+) -> None:
+    """Hourly timestamps keep their hour in Excel instead of collapsing to days."""
+    path = tclient.to_excel(
+        tmp_path / "hourly.xlsx", route=_LOCAL_HOURLY_ROUTE, data="gen", tidy=tidy
+    )
+    back = pd.read_excel(path)
+    expected = tclient.get_data(_LOCAL_HOURLY_ROUTE, data="gen", tidy=tidy)["date"]
+    assert pd.to_datetime(back["date"]).tolist() == expected.tolist()
+    assert back["date"].nunique() == len(_LOCAL_HOURLY_ROWS)
