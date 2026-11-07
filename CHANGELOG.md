@@ -9,9 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
-- wrapkit is now pinned at v0.2.7 (was v0.2.6). Its one fix, month labels
-  such as `2024-6` in period bounds, is in a part this package does not use,
-  so nothing changes here.
+- A source column whose name has accents or umlauts now gets them spelled out
+  in its snake_case name (`Região` becomes `regiao`, was `regi_o`; `Größe`
+  becomes `groesse`, was `gr_e`), so such a column is renamed.
 
 ### Fixed
 
@@ -31,6 +31,22 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   as a calendar day, so all 24 hours of a day showed the same date. Dates
   are now written as plain days only when every timestamp is at midnight;
   hourly data keeps its time.
+- wrapkit is now pinned at v0.2.8 (was v0.2.6), which brings these fixes:
+  - `update_csv` no longer re-adds a stored row whose `period` is blank on
+    every run (Python 3.10 / pandas before 3, where the blank was read back as
+    the text `nan`).
+  - An `AsyncEIA` client can be reused under a second `asyncio.run()`; its
+    throttle raised `RuntimeError` on the next burst of requests.
+  - Dates and times inside `--facets` arrive as typed: `2024-01-15` used to be
+    turned into `2024-'01'-15`. Codes such as `01` are still kept as text.
+  - With `--log-file`, the traceback of a failed command now has the same
+    secrets masked as the log lines. It used to show them: an error that
+    quotes the request URL carried the key.
+  - A cache lifetime of 0 now always refetches. An entry written a moment
+    earlier could still be served when its file time was a hair ahead of the
+    clock.
+  - `--out ./data.csv` now writes to the current directory, as a path with a
+    folder should; it used to land in `outputs/data.csv`.
 
 ## [0.4.2] - 2026-11-04
 
