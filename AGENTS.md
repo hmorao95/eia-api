@@ -26,6 +26,18 @@ Managed with [uv](https://docs.astral.sh/uv/). One command:
 uv sync
 ```
 
+`.python-version` pins the local environment to Python 3.12, the oldest version
+that reads `.pth` files as UTF-8. On Windows, 3.10 and 3.11 read them in the
+ANSI code page, so the editable install breaks when the clone's path has
+non-ASCII characters and `import eia_api` fails. The supported floor is still
+3.10: CI runs the checks there by setting `UV_PYTHON` for the job. Keep that
+variable. A `--python` flag on `uv sync` alone does not hold, because the next
+`uv run` reads `.python-version` and rebuilds `.venv` on 3.12.
+
+To test 3.10 or 3.11 locally, use a separate environment with `src` on the
+path, e.g.
+`UV_PROJECT_ENVIRONMENT=$LOCALAPPDATA/Temp/eia-api310 PYTHONPATH=src uv run -p 3.10 pytest`.
+
 Run anything through `uv run` (the console script lives in `.venv`):
 
 ```bash

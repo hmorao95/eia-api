@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   as a calendar day, so all 24 hours of a day showed the same date. Dates
   are now written as plain days only when every timestamp is at midnight;
   hourly data keeps its time.
+- On Windows, a clone whose path has non-ASCII characters (such as
+  `C:\Users\João\...`) left `eia_api` unimportable when `uv sync` built the
+  environment on Python 3.10 or 3.11, which read the editable install's `.pth`
+  file in the ANSI code page. The development environment now defaults to
+  Python 3.12 (`.python-version`), which reads it as UTF-8. CI still runs the
+  checks on 3.10. The README gives workarounds for 3.10 and 3.11.
 
 ## [0.4.2] - 2026-11-04
 
