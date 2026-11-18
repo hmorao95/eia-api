@@ -14,4 +14,5 @@ Key reminders for this repo:
 - The API key is a secret: never log it, write it to a file, or put it in a cache
   filename.
 - Releases bump the version in `pyproject.toml`, `CITATION.cff`, the README
-  citation and `uv.lock` together; a GitHub release auto-publishes to PyPI.
+  citation and `uv.lock` together; releases are GitHub-only (not on
+  PyPI; `publish.yml` is run by hand).
