@@ -447,7 +447,8 @@ def _encode_data_params(
 
     Raises:
         ValueError: If ``facets`` is not a mapping (for example the raw text of
-            a CLI ``--facets`` value that could not be parsed).
+            a CLI ``--facets`` value that could not be parsed), or if a facet is
+            given an empty list of values.
     """
     if facets is not None and not isinstance(facets, Mapping):
         msg = (
@@ -466,6 +467,13 @@ def _encode_data_params(
             items: list[object] = [values]
         else:
             items = list(values)
+        if not items:
+            # An empty list would drop the filter and fetch every value.
+            msg = (
+                f"facets[{facet_id!r}] is an empty list; pass at least one value, "
+                "or leave the facet out to fetch all of its values."
+            )
+            raise ValueError(msg)
         params.extend((f"facets[{facet_id}][]", str(v)) for v in items)
     if start:
         params.append(("start", str(start)))
@@ -512,6 +520,27 @@ def _total_sort(
             keys.append((column, "asc"))
             named.add(column)
     return keys
+
+
+def _has_content(path: Path) -> bool:
+    """
+    Tell whether a file exists and holds anything besides whitespace.
+
+    :meth:`EIA.update_csv` treats a missing, zero-byte or blank file (such as the
+    lone newline earlier versions wrote for an empty first fetch) as no existing
+    data, so the next run writes the full extract instead of failing to parse it.
+
+    Args:
+        path (Path): The CSV path to inspect.
+
+    Returns:
+        bool: ``True`` when the file exists and its start is not blank.
+    """
+    if not path.exists():
+        return False
+    # Reading the first bytes is enough: a real CSV starts with its header.
+    with path.open("rb") as handle:
+        return bool(handle.read(64).strip())
 
 
 def _rows_to_frame(rows: list[dict[str, Any]], columns: list[str]) -> pd.DataFrame:
@@ -1676,9 +1705,14 @@ class EIA:
             route, data=value_cols, as_polars=False, **kwargs
         )
 
-        # First run: nothing on disk yet, so write the whole extract and return
-        # it (every row is "new").
-        if not path.exists():
+        # First run: nothing on disk yet (or a blank file), so write the whole
+        # extract and return it (every row is "new").
+        if not _has_content(path):
+            if fresh.empty:
+                # Nothing fetched: writing it would leave a CSV holding only a
+                # newline, which no later run could parse.
+                _log.info("No data fetched; %s not written", path)
+                return fresh
             fresh.to_csv(path, index=False)
             _log.info("Created %s with %d rows", path, len(fresh))
             return fresh

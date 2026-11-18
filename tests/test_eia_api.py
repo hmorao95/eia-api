@@ -2247,3 +2247,24 @@ def test_to_excel_keeps_hourly_times(
     expected = tclient.get_data(_LOCAL_HOURLY_ROUTE, data="gen", tidy=tidy)["date"]
     assert pd.to_datetime(back["date"]).tolist() == expected.tolist()
     assert back["date"].nunique() == len(_LOCAL_HOURLY_ROWS)
+
+
+def test_get_data_rejects_empty_facet_list(client: EIA) -> None:
+    """An empty facet list raises instead of silently fetching every value."""
+    with pytest.raises(ValueError, match="empty list"):
+        client.get_data(_ROUTE, data="price", facets={"stateid": []})
+
+
+def test_update_csv_empty_first_fetch_writes_nothing(
+    client: EIA, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty first fetch leaves no file, so the next run can still fill it."""
+    path = tmp_path / "prices.csv"
+    with monkeypatch.context() as patch:
+        patch.setitem(globals(), "_ROWS", [])  # the API returns no rows
+        assert client.update_csv(path, route=_ROUTE, data="price").empty
+    assert not path.exists()
+    # A blank file an earlier version left behind counts as no data too.
+    path.write_bytes(b"\r\n")
+    assert len(client.update_csv(path, route=_ROUTE, data="price")) == 3
+    assert len(pd.read_csv(path)) == 3
