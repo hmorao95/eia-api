@@ -9,6 +9,9 @@ on:
 jobs:
   quality:
     runs-on: ubuntu-latest
+    env:
+      # .python-version pins 3.12 for local clones; this keeps every uv command on 3.10.
+      UV_PYTHON: "3.10"
     steps:
       - uses: actions/checkout@v7
 

@@ -31,6 +31,37 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   wrote a CSV holding only a newline, and every later run failed with
   `EmptyDataError`. It now writes nothing in that case, and a blank file left
   by an earlier version is treated like a missing one.
+- On Windows, a clone whose path has non-ASCII characters (such as
+  `C:\Users\João\...`) left `eia_api` unimportable when `uv sync` built the
+  environment on Python 3.10 or 3.11, which read the editable install's `.pth`
+  file in the ANSI code page. The development environment now defaults to
+  Python 3.12 (`.python-version`), which reads it as UTF-8. CI still runs the
+  checks on 3.10. The README gives workarounds for 3.10 and 3.11.
+
+### Security
+
+- wrapkit is now pinned at
+  [v0.2.9](https://github.com/hmorao95/wrapkit/releases/tag/v0.2.9) (was
+  v0.2.6), which brings these fixes:
+  - The API key is now also masked in records from `urllib3.connection`,
+    `urllib3.poolmanager` and `httpcore`. urllib3 logs the full request URL,
+    key included, at WARNING when a response's headers fail to parse, and
+    httpcore logs response headers at DEBUG. Those loggers were not covered,
+    so a script or notebook with root log handlers could log the key in clear.
+  - Cache entries are written through a temp file created exclusively under a
+    random name, owner-only on POSIX. Another account that can write the
+    cache directory can no longer redirect the write to another file. An
+    entry that is not a regular file is ignored.
+  - The CLI's one-line error message is masked by wrapkit too. eia-api
+    already masked the key in HTTP errors, so this is a second layer; the
+    output is unchanged.
+  - Also from v0.2.7 and v0.2.8:
+    - `period_start` and `period_end` read more month labels.
+    - Incremental keys keep a date's time zone and fractions of a second.
+    - The async throttle works under more than one event loop.
+    - A failed certificate check is no longer retried.
+    - `snake` keeps accented letters. EIA's column names are ASCII, so
+      nothing is renamed.
 
 ## [0.4.2] - 2026-11-04
 
