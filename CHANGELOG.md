@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- wrapkit is now pinned at
+  [v0.2.10](https://github.com/hmorao95/wrapkit/releases/tag/v0.2.10) (was
+  v0.2.9): a cached answer whose file time is ahead of the clock is now
+  fetched again instead of being served as fresh.
+
 ## [0.4.3] - 2026-11-18
 
 ### Fixed
